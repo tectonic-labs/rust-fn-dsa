@@ -123,14 +123,12 @@ pub use fn_dsa_vrfy::{
 
 #[cfg(feature = "eth_falcon")]
 pub use fn_dsa_comm::eth_falcon::{
-    decode_signature_to_packed,
-    decode_pubkey_to_ntt_packed,
-    hash_to_point_keccak,
+    decode_pubkey_to_ntt_packed, decode_signature_to_packed, hash_to_point_keccak,
 };
 #[cfg(feature = "eth_falcon")]
-pub use fn_dsa_sign::eth_falcon::{sign as eth_falcon_sign, generate_salt};
+pub use fn_dsa_sign::eth_falcon::{generate_salt, sign as eth_falcon_sign};
 #[cfg(feature = "eth_falcon")]
-pub use fn_dsa_vrfy::eth_falcon::{verify as eth_falcon_verify};
+pub use fn_dsa_vrfy::eth_falcon::verify as eth_falcon_verify;
 
 #[cfg(test)]
 mod tests {
@@ -586,26 +584,22 @@ mod eth_falcon_tests {
 
     use super::*;
 
+    use fn_dsa_comm::eth_falcon::{SALT_LEN, SIGNATURE_ABI_PACKED_LENGTH};
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
-    use std::{
-        println,
-        vec::Vec,
-    };
+    use std::{println, vec::Vec};
 
-    fn keygen_random() ->([u8; vrfy_key_size(FN_DSA_LOGN_512)], [u8; sign_key_size(FN_DSA_LOGN_512)]) {
+    fn keygen_random() -> (
+        [u8; vrfy_key_size(FN_DSA_LOGN_512)],
+        [u8; sign_key_size(FN_DSA_LOGN_512)],
+    ) {
         let mut rng = ChaCha8Rng::from_entropy();
         let mut kg = KeyPairGeneratorStandard::default();
         let mut sk = [0u8; sign_key_size(FN_DSA_LOGN_512)];
         let mut vk = [0u8; vrfy_key_size(FN_DSA_LOGN_512)];
 
         // Generate a test keypair
-        kg.keygen(
-            FN_DSA_LOGN_512,
-            &mut rng,
-            &mut sk,
-            &mut vk,
-        );
+        kg.keygen(FN_DSA_LOGN_512, &mut rng, &mut sk, &mut vk);
         (vk, sk)
     }
 
@@ -615,9 +609,10 @@ mod eth_falcon_tests {
 
         let message = b"Hello, ETHFALCON!";
         let salt = generate_salt();
+        let mut signature = [0u8; sign_key_size(FN_DSA_LOGN_512)];
 
         // Sign the message
-        let signature = eth_falcon_sign(&sk, message, &salt).expect("Signing should succeed");
+        eth_falcon_sign(&sk, message, &salt, &mut signature).expect("Signing should succeed");
 
         println!("Signature length: {}", signature.len());
         println!("Signature header: 0x{:02x}", signature[0]);
@@ -642,12 +637,13 @@ mod eth_falcon_tests {
 
         let message = b"ETHFALCON test message";
         let salt = generate_salt();
+        let mut signature = [0u8; sign_key_size(FN_DSA_LOGN_512)];
 
         println!("\n=== ETHFALCON Sign+Verify Roundtrip Test ===");
         println!("Message: {:?}", std::str::from_utf8(message).unwrap());
 
         // Sign the message
-        let signature = eth_falcon_sign(&sk, message, &salt).expect("Signing should succeed");
+        eth_falcon_sign(&sk, message, &salt, &mut signature).expect("Signing should succeed");
         println!(
             "✓ Signed successfully (signature length: {})",
             signature.len()
@@ -668,10 +664,10 @@ mod eth_falcon_tests {
         );
 
         // Extract salt from signature (it's at bytes 1-41)
-        let signature_salt = &signature[1..41];
+        let signature_salt = <[u8; SALT_LEN]>::try_from(&signature[1..41]).unwrap();
 
         // Verify the signature
-        let is_valid = eth_falcon_verify(message, signature_salt, &s2_packed, &pk_ntt_packed)
+        let is_valid = eth_falcon_verify(message, &signature_salt, &s2_packed, &pk_ntt_packed)
             .expect("Verification should not error");
 
         println!(
@@ -697,7 +693,7 @@ mod eth_falcon_tests {
 
         // Parse sm structure
         assert!(sm.len() >= 2 + 40 + mlen + 1, "sm too short");
-        let salt = &sm[2..42];
+        let salt = <[u8; SALT_LEN]>::try_from(&sm[2..42]).unwrap();
         let message_in_sm = &sm[42..42 + mlen];
         let header = sm[42 + mlen];
 
@@ -712,7 +708,7 @@ mod eth_falcon_tests {
         let s2_packed = decode_kat_signature(&sm, mlen).expect("Failed to decode signature");
 
         // Verify the signature
-        let result = eth_falcon_verify(&msg, salt, &s2_packed, &pk_ntt_packed);
+        let result = eth_falcon_verify(&msg, &salt, &s2_packed, &pk_ntt_packed);
         assert!(
             result.is_ok(),
             "Verification should not error: {:?}",
@@ -725,7 +721,10 @@ mod eth_falcon_tests {
     ///
     /// KAT sm format: slen(2) + salt(40) + message(mlen) + header(0x29) + compressed_sig
     /// Function format: header(0x39) + salt(40) + compressed_sig
-    fn decode_kat_signature(sm: &[u8], mlen: usize) -> Result<Vec<u8>, &'static str> {
+    fn decode_kat_signature(
+        sm: &[u8],
+        mlen: usize,
+    ) -> Result<[u8; SIGNATURE_ABI_PACKED_LENGTH], &'static str> {
         if sm.len() < 2 + 40 + mlen + 1 {
             return Err("sm too short");
         }

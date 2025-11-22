@@ -102,7 +102,7 @@ pub trait VerifyingKey: Sized {
 macro_rules! vrfy_key_impl {
     ($typename:ident, $logn_min:expr, $logn_max:expr) => {
         #[doc = concat!("Signature verifier for degrees (`logn`) ",
-                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
+                        stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
         #[derive(Copy, Clone, Debug)]
         pub struct $typename {
             logn: u32,
@@ -408,14 +408,10 @@ unsafe fn verify_avx2_inner(
 #[cfg(feature = "eth_falcon")]
 /// Support for verifying ETHFALCON signatures
 pub mod eth_falcon {
-    extern crate alloc;
-
     use super::*;
-    use alloc::{
-        vec,
-        vec::Vec,
+    use fn_dsa_comm::eth_falcon::{
+        hash_to_point_keccak, PUBKEY_NTT_PACKED_LENGTH, SALT_LEN, SIGNATURE_ABI_PACKED_LENGTH,
     };
-    use fn_dsa_comm::eth_falcon::hash_to_point_keccak;
 
     /// Falcon-512 parameters
     const N: usize = 512;
@@ -438,12 +434,12 @@ pub mod eth_falcon {
     /// * `Err` if inputs are malformed
     pub fn verify(
         message: &[u8],
-        salt: &[u8],
-        s2_packed: &[u8],
-        pk_ntt_packed: &[u8],
+        salt: &[u8; SALT_LEN],
+        s2_packed: &[u8; SIGNATURE_ABI_PACKED_LENGTH],
+        pk_ntt_packed: &[u8; PUBKEY_NTT_PACKED_LENGTH],
     ) -> Result<bool, &'static str> {
         // Validate inputs
-        if salt.len() != 40 {
+        if salt.len() != SALT_LEN {
             return Err("Salt must be exactly 40 bytes");
         }
 
@@ -461,7 +457,7 @@ pub mod eth_falcon {
         mq::mqpoly_ext_to_int(LOGN, &mut hashed);
 
         // Step 4: Convert s2 to NTT format
-        let mut s2_ext = vec![0u16; N];
+        let mut s2_ext = [0u16; N];
         mq::mqpoly_signed_to_ext(LOGN, &s2_coeffs, &mut s2_ext);
         mq::mqpoly_ext_to_int(LOGN, &mut s2_ext);
         mq::mqpoly_int_to_NTT(LOGN, &mut s2_ext);
@@ -495,12 +491,13 @@ pub mod eth_falcon {
     ///
     /// Solidity stores coefficients in uint256[32] where each uint256 contains 16 coefficients
     /// packed LSB-first. abi.encodePacked outputs this as 1024 bytes (32 × 32 bytes, big-endian).
-    fn parse_abi_packed_u16(data: &[u8]) -> Result<Vec<u16>, &'static str> {
+    fn parse_abi_packed_u16(data: &[u8]) -> Result<[u16; N], &'static str> {
         if data.len() != 1024 {
             return Err("abi.encodePacked(uint256[32]) must be 1024 bytes");
         }
 
-        let mut coeffs = Vec::with_capacity(512);
+        let mut coeffs = [0u16; N];
+        let mut coeff_iter = 0;
 
         // Process 32 uint256 values (32 bytes each)
         for chunk_idx in 0..32 {
@@ -510,7 +507,8 @@ pub mod eth_falcon {
             for coeff_idx in 0..16 {
                 let byte_offset = 30 - (coeff_idx * 2); // Rightmost bytes first
                 let coeff = u16::from_be_bytes([chunk[byte_offset], chunk[byte_offset + 1]]);
-                coeffs.push(coeff);
+                coeffs[coeff_iter] = coeff;
+                coeff_iter += 1;
             }
         }
 
@@ -520,19 +518,19 @@ pub mod eth_falcon {
     /// Parse Solidity abi.encodePacked(uint256[32]) format to signed i16 coefficients
     ///
     /// Values > Q/2 are normalized to negative (mod Q arithmetic)
-    fn parse_abi_packed_i16(data: &[u8]) -> Result<Vec<i16>, &'static str> {
+    fn parse_abi_packed_i16(data: &[u8]) -> Result<[i16; N], &'static str> {
         const Q: u16 = 12289;
         let u16_coeffs = parse_abi_packed_u16(data)?;
+        let mut i16_coeffs = [0i16; N];
+        for (i, &coeff_u16) in i16_coeffs.iter_mut().zip(u16_coeffs.iter()) {
+            *i = if coeff_u16 > Q / 2 {
+                (coeff_u16 as i32 - Q as i32) as i16
+            } else {
+                coeff_u16 as i16
+            }
+        }
 
-        Ok(u16_coeffs
-            .iter()
-            .map(|&coeff_u16| {
-                if coeff_u16 > Q / 2 {
-                    (coeff_u16 as i32 - Q as i32) as i16
-                } else {
-                    coeff_u16 as i16
-                }
-            }).collect())
+        Ok(i16_coeffs)
     }
 
     #[cfg(test)]
@@ -543,40 +541,13 @@ pub mod eth_falcon {
         fn test_verify_basic() {
             // Basic validation tests
             let message = b"test message";
-            let salt = [0u8; 40];
-            let s2_packed = [0u8; 1024]; // abi.encodePacked format
-            let pk_ntt_packed = [0u8; 1024]; // abi.encodePacked format
+            let salt = [0u8; SALT_LEN];
+            let s2_packed = [0u8; SIGNATURE_ABI_PACKED_LENGTH]; // abi.encodePacked format
+            let pk_ntt_packed = [0u8; PUBKEY_NTT_PACKED_LENGTH]; // abi.encodePacked format
 
             // This will fail validation (zero signature), but should not panic
             let result = verify(message, &salt, &s2_packed, &pk_ntt_packed);
             assert!(result.is_ok());
-        }
-
-        #[test]
-        fn test_verify_wrong_salt_length() {
-            let message = b"test";
-            let salt = [0u8; 32]; // Wrong length
-            let s2_packed = [0u8; 1024];
-            let pk_ntt_packed = [0u8; 1024];
-
-            let result = verify(message, &salt, &s2_packed, &pk_ntt_packed);
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "Salt must be exactly 40 bytes");
-        }
-
-        #[test]
-        fn test_verify_wrong_signature_length() {
-            let message = b"test";
-            let salt = [0u8; 40];
-            let s2_packed = [0u8; 512]; // Wrong length
-            let pk_ntt_packed = [0u8; 1024];
-
-            let result = verify(message, &salt, &s2_packed, &pk_ntt_packed);
-            assert!(result.is_err());
-            assert_eq!(
-                result.unwrap_err(),
-                "abi.encodePacked(uint256[32]) must be 1024 bytes"
-            );
         }
 
         #[test]
@@ -589,7 +560,7 @@ pub mod eth_falcon {
             let salt = hex::decode(
                 "46b9dd2b0ba88d13233b3feb743eeb243fcd52ea62b81b82b50c27646ed5762fd75dc4ddd8c0f200",
             )
-                .unwrap();
+            .unwrap();
 
             // Public key from Solidity: console.log("PK:", vm.toString(abi.encodePacked(tmp_pkc)));
             // This is the ACTUAL abi.encodePacked(uint256[32]) output (1024 bytes)
@@ -600,9 +571,21 @@ pub mod eth_falcon {
             let s2_packed = hex::decode("006b01372f0e00e101412f42005c2fef2f6a001200122ff72f3300582e6600aa00af00602f7e2ece008d008c2faf007a2fa8008000ac2f7400cf2f9a00fc001f000a001b2f792ee2000c0026000900462edc000e008e00012f732fd100a82f3e2faf001500672f58006100f72fab2fcc0100007d2fdd2fd3009b2ff02ff200282fd20023004100462e2e00f0008f00b700302fe500b7002d2fb62fdc006c2f432f932fed00b4002a2f852fec004400ef001300172fb700e500332feb2f5b000600322f4e2f902f2b2e6800912fa52fe30026005f2fe900b12f682fd8008a2fb92fbb018f00a32fd8005400af002d0036004700202e982f48006200c6003d00e0002c00fb0030005e000c01652ee400e0007b001800472fda00af2f4d0011006a006f00cf00c52f072fe62efc00410037008000952f82004b006e003d008300552f6900b02faf00302f66007700ba2f7b2f2a2fe7007d2fe02fbd2fd42f912f592fb12ff42f072fb900342f7b2fd62fd22f452f2700632f8b2f152f6401b00000004b2fb500552fe82f6b2fab2fab2ee90026002b2f67005b004801602fc30050008f00372f9a00c500762fc92f682ff92ff72f7f2f4d00532ff200e12f6f2f822fe42ff12e962f2b2eeb002f00ee01970056001a2f8400d000952fae2f732f5b00e72f8e2fa62fdc2e8101a72f8e002a2f1f00800059005c2fff003700d62fe92f7f00c600eb2fe700ca2fbc2fda2fa200162f4f2fd700112ffe2fb92fbd2f532f3c2f3c006600392fa300b6002d000f000a00852fd92fb4009a01392fd300d1004f002b2f1901a72f3e00bc00ce2ff92eb0018d002d00142f882fd6006200982ff92f9c0002008200980009002c2fa000b82fa22f3c2f8d2f1c2f550058004a2fb700f42fdb007c00a5009a0039002d2f7f2e2e2eda01372fd301282ff6007c003c00c700982f6e2f512f802fd60068001e00e72f602fd1005e2fe72fa1007c2f4e00d400212ec82fea2ffe2f2e006c002f2fc32ebe2fcd2fe700d72fc32f4501412fb40075001101792ebd2f3a00fc2fb800882f320115000400852f092f3400692f2e2ff02ff000ac2f822fdc003e2ff02f1d2ed62f5e2fb4004500dd2fad00c62f47012e2f4100c600552fc42ff42fab2ff0002a2f942fb12f242f40005500202fac00042f5400260083012a2fea2f1d2faf009f007600802fbc2fe32f5700402ffb2fc32f7700f8014200dd2fec002800102fe52fb800a800b42f880003015301202f522f33006a2f9c005d2f762f9a005e2f982fbb2feb012b2f822f8e2f962f702f9f2e990098300000452fab2f3700c80080009d00370014005f2fb02fbd2ff02f08003f2ee900f72ef9004a2f0c013c00b92f862f5100372f442f06007f01a100a92fd000292fa32fd602482f6f2fd42f8100ad2f7500722ff90006").unwrap();
 
             // Validate lengths
-            assert_eq!(salt.len(), 40, "Salt should be 40 bytes");
-            assert_eq!(pk_ntt_packed.len(), 1024, "Public key should be 1024 bytes");
-            assert_eq!(s2_packed.len(), 1024, "Signature should be 1024 bytes");
+            assert_eq!(salt.len(), SALT_LEN, "Salt should be 40 bytes");
+            assert_eq!(
+                pk_ntt_packed.len(),
+                PUBKEY_NTT_PACKED_LENGTH,
+                "Public key should be 1024 bytes"
+            );
+            assert_eq!(
+                s2_packed.len(),
+                SIGNATURE_ABI_PACKED_LENGTH,
+                "Signature should be 1024 bytes"
+            );
+
+            let salt = <[u8; SALT_LEN]>::try_from(salt).unwrap();
+            let s2_packed = <[u8; SIGNATURE_ABI_PACKED_LENGTH]>::try_from(s2_packed).unwrap();
+            let pk_ntt_packed = <[u8; PUBKEY_NTT_PACKED_LENGTH]>::try_from(pk_ntt_packed).unwrap();
 
             // Call the verification function with raw byte slices
             let result = verify(message, &salt, &s2_packed, &pk_ntt_packed);

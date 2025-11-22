@@ -222,17 +222,25 @@ pub fn hash_to_point(
     }
 }
 
-
 #[cfg(feature = "eth_falcon")]
 /// Support for ETHFALCON methods
 pub mod eth_falcon {
     extern crate alloc;
-    use super::{codec, mq, vrfy_key_size};
+    use super::{codec, mq, vrfy_key_size, FN_DSA_LOGN_512};
 
-    use alloc::{vec, vec::Vec};
+    use alloc::vec::Vec;
     use tiny_keccak::{Hasher, Keccak};
 
     const KECCAK_OUTPUT: usize = 32;
+
+    /// The output length of the pubkey from calling `decode_pubkey_to_ntt_packed`
+    pub const PUBKEY_NTT_PACKED_LENGTH: usize = 1024;
+
+    /// The output length of the signature from calling `decode_signature_to_packed`
+    pub const SIGNATURE_ABI_PACKED_LENGTH: usize = 1024;
+
+    /// The required length for salts
+    pub const SALT_LEN: usize = 40;
 
     /// KeccakXOF implements the Keccak PRNG as used in ETHFALCON
     /// This replaces SHAKE256 in standard Falcon
@@ -426,7 +434,9 @@ pub mod eth_falcon {
     ///
     /// Falcon public key format: [header (1 byte)] + [compressed h]
     /// abi.encodePacked format: 1024 bytes (32 uint256 values × 32 bytes each, h in NTT form)
-    pub fn decode_pubkey_to_ntt_packed(pubkey: &[u8]) -> Result<Vec<u8>, &'static str> {
+    pub fn decode_pubkey_to_ntt_packed(
+        pubkey: &[u8],
+    ) -> Result<[u8; SIGNATURE_ABI_PACKED_LENGTH], &'static str> {
         if pubkey.len() < 1 {
             return Err("Public key too short");
         }
@@ -434,7 +444,7 @@ pub mod eth_falcon {
         let header = pubkey[0];
         let logn = (header & 0x0F) as u32;
 
-        if logn != 9 {
+        if logn != FN_DSA_LOGN_512 {
             return Err("Only Falcon-512 (logn=9) supported");
         }
 
@@ -442,10 +452,11 @@ pub mod eth_falcon {
             return Err("Invalid public key length");
         }
 
-        let n = 1usize << logn; // 512
+        // let n = 1usize << logn; // 512
+        assert_eq!(1usize << logn, 512);
 
         // Decode h from compressed format
-        let mut h = vec![0u16; n];
+        let mut h = [0u16; 512];
         codec::modq_decode(&pubkey[1..], &mut h).ok_or("Failed to decode public key")?;
 
         // Convert h to NTT form
@@ -454,7 +465,7 @@ pub mod eth_falcon {
 
         // Convert h_ntt to abi.encodePacked(uint256[32]) format
         // 512 coefficients → 32 uint256 (16 coefficients per uint256, LSB-first)
-        let mut packed = vec![0u8; 1024];
+        let mut packed = [0u8; 1024];
 
         for chunk_idx in 0..32 {
             let mut value = [0u8; 32]; // Big-endian uint256
@@ -486,7 +497,9 @@ pub mod eth_falcon {
     ///
     /// Falcon signature format: [header (1 byte)] + [salt (40 bytes)] + [compressed s2]
     /// abi.encodePacked format: 1024 bytes (32 uint256 values × 32 bytes each)/
-    pub fn decode_signature_to_packed(signature: &[u8]) -> Result<Vec<u8>, &'static str> {
+    pub fn decode_signature_to_packed(
+        signature: &[u8],
+    ) -> Result<[u8; SIGNATURE_ABI_PACKED_LENGTH], &'static str> {
         if signature.len() < 41 {
             return Err("Signature too short");
         }
@@ -494,22 +507,23 @@ pub mod eth_falcon {
         let header = signature[0];
         let logn = (header & 0x0F) as u32;
 
-        if logn != 9 {
+        if logn != FN_DSA_LOGN_512 {
             return Err("Only Falcon-512 (logn=9) supported");
         }
 
-        let n = 1usize << logn; // 512
+        // let n = 1usize << logn; // 512
+        assert_eq!(1usize << logn, 512);
         let compressed_s2 = &signature[41..];
 
         // Decompress s2 using fn-dsa's codec
-        let mut s2 = vec![0i16; n];
+        let mut s2 = [0i16; 512];
         if !codec::comp_decode(compressed_s2, &mut s2) {
             return Err("Failed to decompress signature");
         }
 
         // Convert s2 to abi.encodePacked(uint256[32]) format
         // 512 coefficients → 32 uint256 (16 coefficients per uint256, LSB-first)
-        let mut packed = vec![0u8; 1024];
+        let mut packed = [0u8; SIGNATURE_ABI_PACKED_LENGTH];
 
         for chunk_idx in 0..32 {
             let mut value = [0u8; 32]; // Big-endian uint256

@@ -129,7 +129,7 @@ pub trait SigningKey: Sized {
 macro_rules! sign_key_impl {
     ($typename:ident, $logn_min:expr, $logn_max:expr) => {
         #[doc = concat!("Signature generator for degrees (`logn`) ",
-                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
+                        stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
         #[derive(Zeroize, ZeroizeOnDrop)]
         pub struct $typename {
             f: [i8; 1 << ($logn_max)],
@@ -790,24 +790,22 @@ fn sign_inner<T: CryptoRng + RngCore, P: PRNG>(
 #[cfg(feature = "eth_falcon")]
 /// Support for ETH FALCON signature creation
 pub mod eth_falcon {
-    extern crate alloc;
-
-    use super::{
-        INV_Q, compute_basis_inner,
-    };
-    use alloc::{vec, vec::Vec};
+    use super::{compute_basis_inner, INV_Q};
     use fn_dsa_comm::{
         codec,
-        eth_falcon::hash_to_point_keccak,
+        eth_falcon::{hash_to_point_keccak, SALT_LEN},
         mq,
         shake::{self, SHAKE256_PRNG},
-        sign_key_size, signature_size, vrfy_key_size,
+        sign_key_size, vrfy_key_size, FN_DSA_LOGN_512,
     };
     use rand_chacha::ChaCha20Rng;
     use rand_core::{RngCore, SeedableRng};
 
-    /// The size of ETHFALCON salts
-    pub const SALT_LEN: usize = 40;
+    const N: usize = 512;
+    const DOUBLE: usize = 2 * N;
+    const QUAD: usize = 4 * N;
+    const NINE: usize = 9 * N;
+    const SIGNING_KEY_LENGTH: usize = 1281;
 
     /// Sign a message using ETHFALCON (Keccak-256 XOF)
     ///
@@ -821,17 +819,22 @@ pub mod eth_falcon {
     /// # Returns
     /// * `Ok(signature)` - Falcon signature bytes
     /// * `Err` if signing fails
-    pub fn sign(private_key: &[u8], message: &[u8], salt: &[u8; SALT_LEN]) -> Result<Vec<u8>, &'static str> {
+    pub fn sign(
+        private_key: &[u8; SIGNING_KEY_LENGTH],
+        message: &[u8],
+        salt: &[u8; SALT_LEN],
+        signature: &mut [u8],
+    ) -> Result<(), &'static str> {
         // Decode the signing key to get f, g, F, G, and basis
         let (logn, f, g, F, G, basis) = decode_signing_key(private_key)?;
+        assert_eq!(logn, FN_DSA_LOGN_512);
+        assert_eq!(1usize << logn, N);
 
         // Generate random seed for signing
         let mut rng = ChaCha20Rng::from_entropy();
-        let mut signature = vec![0u8; signature_size(logn)];
-        let n = 1usize << logn;
-        let mut tmp_i16 = vec![0i16; n];
-        let mut tmp_u16 = vec![0u16; 2 * n];
-        let mut tmp_flr = vec![super::flr::FLR::ZERO; 9 * n];
+        let mut tmp_i16 = [0i16; N];
+        let mut tmp_u16 = [0u16; DOUBLE];
+        let mut tmp_flr = [super::flr::FLR::ZERO; NINE];
         sign_ethfalcon_inner(
             logn,
             &mut rng,
@@ -841,14 +844,14 @@ pub mod eth_falcon {
             &G,
             message,
             salt,
-            &mut signature,
+            signature,
             &basis,
             &mut tmp_i16,
             &mut tmp_u16,
             &mut tmp_flr,
         )?;
 
-        Ok(signature)
+        Ok(())
     }
 
     /// Generate a random salt for signing
@@ -889,21 +892,22 @@ pub mod eth_falcon {
         tmp_u16: &mut [u16],
         tmp_flr: &mut [super::flr::FLR],
     ) -> Result<(), &'static str> {
-        let n = 1usize << logn;
-        assert_eq!(f.len(), n);
-        assert_eq!(g.len(), n);
-        assert_eq!(F.len(), n);
-        assert_eq!(G.len(), n);
-        assert_eq!(salt.len(), 40);
+        // let n = 1usize << logn;
+        assert_eq!(1usize << logn, N);
+        assert_eq!(f.len(), N);
+        assert_eq!(g.len(), N);
+        assert_eq!(F.len(), N);
+        assert_eq!(G.len(), N);
+        assert_eq!(salt.len(), SALT_LEN);
 
         // Signature generation loop
         // Usually works on first attempt, but occasionally we need to retry
         // if signature is not short enough or cannot be encoded
         loop {
-            let hm = &mut tmp_u16[0..n];
+            let hm = &mut tmp_u16[0..N];
 
             // THIS IS THE KEY CHANGE: Use our Keccak hash_to_point instead of SHAKE256
-            hash_to_point_keccak(n, message, salt)
+            hash_to_point_keccak(N, message, salt)
                 .map_err(|_| "Hash to point failed")?
                 .iter()
                 .enumerate()
@@ -919,12 +923,12 @@ pub mod eth_falcon {
             {
                 compute_basis_inner(logn, f, g, F, G, tmp_flr);
 
-                let (b00, work) = tmp_flr.split_at_mut(n);
-                let (b01, work) = work.split_at_mut(n);
-                let (b10, work) = work.split_at_mut(n);
-                let (b11, work) = work.split_at_mut(n);
-                let (t0, work) = work.split_at_mut(n);
-                let (t1, _) = work.split_at_mut(n);
+                let (b00, work) = tmp_flr.split_at_mut(N);
+                let (b01, work) = work.split_at_mut(N);
+                let (b10, work) = work.split_at_mut(N);
+                let (b11, work) = work.split_at_mut(N);
+                let (t0, work) = work.split_at_mut(N);
+                let (t1, _) = work.split_at_mut(N);
 
                 // Compute g00, g01, g11 (Gram matrix)
                 t0.copy_from_slice(&*b01);
@@ -950,16 +954,16 @@ pub mod eth_falcon {
 
             #[cfg(not(feature = "small_context"))]
             {
-                let (b00, work) = basis.split_at(n);
-                let (b01, work) = work.split_at(n);
-                let (b10, work) = work.split_at(n);
-                let (b11, _) = work.split_at(n);
+                let (b00, work) = basis.split_at(N);
+                let (b01, work) = work.split_at(N);
+                let (b10, work) = work.split_at(N);
+                let (b11, _) = work.split_at(N);
 
-                let (g00, work) = tmp_flr.split_at_mut(n);
-                let (g01, work) = work.split_at_mut(n);
-                let (g11, work) = work.split_at_mut(n);
-                let (t0, work) = work.split_at_mut(n);
-                let (t1, _) = work.split_at_mut(n);
+                let (g00, work) = tmp_flr.split_at_mut(N);
+                let (g01, work) = work.split_at_mut(N);
+                let (g11, work) = work.split_at_mut(N);
+                let (t0, work) = work.split_at_mut(N);
+                let (t1, _) = work.split_at_mut(N);
 
                 g00.copy_from_slice(b00);
                 super::poly::poly_mulownadj_fft(logn, g00);
@@ -985,14 +989,14 @@ pub mod eth_falcon {
 
             // Memory layout: g00 g01 g11 b11 b01
             {
-                let (_, work) = tmp_flr.split_at_mut(3 * n);
-                let (b11, work) = work.split_at_mut(n);
-                let (b01, work) = work.split_at_mut(n);
-                let (t0, work) = work.split_at_mut(n);
-                let (t1, _) = work.split_at_mut(n);
+                let (_, work) = tmp_flr.split_at_mut(3 * N);
+                let (b11, work) = work.split_at_mut(N);
+                let (b01, work) = work.split_at_mut(N);
+                let (t0, work) = work.split_at_mut(N);
+                let (t1, _) = work.split_at_mut(N);
 
                 // Set target to [hm, 0]
-                for i in 0..n {
+                for i in 0..N {
                     t0[i] = super::flr::FLR::from_i32(hm[i] as i32);
                 }
 
@@ -1006,35 +1010,35 @@ pub mod eth_falcon {
             }
 
             // Move (t0, t1) back
-            tmp_flr.copy_within((5 * n)..(7 * n), 3 * n);
+            tmp_flr.copy_within((5 * N)..(7 * N), 3 * N);
 
             // Apply Gaussian sampling
             {
-                let (g00, work) = tmp_flr.split_at_mut(n);
-                let (g01, work) = work.split_at_mut(n);
-                let (g11, work) = work.split_at_mut(n);
-                let (t0, work) = work.split_at_mut(n);
-                let (t1, work) = work.split_at_mut(n);
+                let (g00, work) = tmp_flr.split_at_mut(N);
+                let (g01, work) = work.split_at_mut(N);
+                let (g11, work) = work.split_at_mut(N);
+                let (t0, work) = work.split_at_mut(N);
+                let (t1, work) = work.split_at_mut(N);
                 samp.ffsamp_fft(t0, t1, g00, g01, g11, work);
             }
 
             // Rearrange to: b00 b01 b10 b11 t0 t1
-            tmp_flr.copy_within((3 * n)..(5 * n), 4 * n);
+            tmp_flr.copy_within((3 * N)..(5 * N), 4 * N);
 
             #[cfg(feature = "small_context")]
             compute_basis_inner(logn, f, g, F, G, tmp_flr);
 
             #[cfg(not(feature = "small_context"))]
-            tmp_flr[..(4 * n)].copy_from_slice(&basis[..(4 * n)]);
+            tmp_flr[..(4 * N)].copy_from_slice(&basis[..(4 * N)]);
 
-            let (b00, work) = tmp_flr.split_at_mut(n);
-            let (b01, work) = work.split_at_mut(n);
-            let (b10, work) = work.split_at_mut(n);
-            let (b11, work) = work.split_at_mut(n);
-            let (t0, work) = work.split_at_mut(n);
-            let (t1, work) = work.split_at_mut(n);
-            let (tx, work) = work.split_at_mut(n);
-            let (ty, _) = work.split_at_mut(n);
+            let (b00, work) = tmp_flr.split_at_mut(N);
+            let (b01, work) = work.split_at_mut(N);
+            let (b10, work) = work.split_at_mut(N);
+            let (b11, work) = work.split_at_mut(N);
+            let (t0, work) = work.split_at_mut(N);
+            let (t1, work) = work.split_at_mut(N);
+            let (tx, work) = work.split_at_mut(N);
+            let (ty, _) = work.split_at_mut(N);
 
             // Get lattice point corresponding to sampled vector
             tx.copy_from_slice(t0);
@@ -1053,15 +1057,15 @@ pub mod eth_falcon {
             // Compute signature and check norm
             let mut sqn = 0u32;
             let mut ng = 0;
-            for i in 0..n {
+            for i in 0..N {
                 let z = (hm[i] as i32) - (t0[i].rint() as i32);
                 let z = (z as i16) as i32;
                 sqn = sqn.wrapping_add((z * z) as u32);
                 ng |= sqn;
             }
 
-            let s2 = &mut tmp_i16[..n];
-            for i in 0..n {
+            let s2 = &mut tmp_i16[..N];
+            for i in 0..N {
                 let sz = (-t1[i].rint()) as i16;
                 let z = sz as i32;
                 sqn = sqn.wrapping_add((z * z) as u32);
@@ -1094,17 +1098,14 @@ pub mod eth_falcon {
     ) -> Result<
         (
             u32,
-            Vec<i8>,
-            Vec<i8>,
-            Vec<i8>,
-            Vec<i8>,
-            Vec<super::flr::FLR>,
+            [i8; N],
+            [i8; N],
+            [i8; N],
+            [i8; N],
+            [super::flr::FLR; QUAD],
         ),
         &'static str,
     > {
-        const LOGN_MIN: u32 = 9; // Falcon-512
-        const LOGN_MAX: u32 = 9; // Falcon-512 only
-
         if src.len() < 1 {
             return Err("Key too short");
         }
@@ -1113,22 +1114,23 @@ pub mod eth_falcon {
             return Err("Invalid key header");
         }
         let logn = (head & 0x0F) as u32;
-        if logn < LOGN_MIN || logn > LOGN_MAX {
+        if logn != FN_DSA_LOGN_512 {
             return Err("Invalid logn (only Falcon-512 supported)");
         }
         if src.len() != sign_key_size(logn) {
             return Err("Invalid key length");
         }
 
-        let n = 1usize << logn;
+        // let n = 1usize << logn;
+        assert_eq!(1usize << logn, N);
 
-        let mut f = vec![0i8; n];
-        let mut g = vec![0i8; n];
-        let mut F = vec![0i8; n];
-        let mut G = vec![0i8; n];
-        let mut vrfy_key = vec![0u8; vrfy_key_size(logn)];
+        let mut f = [0i8; N];
+        let mut g = [0i8; N];
+        let mut F = [0i8; N];
+        let mut G = [0i8; N];
+        let mut vrfy_key = [0u8; vrfy_key_size(FN_DSA_LOGN_512)];
         let mut hashed_vrfy_key = [0u8; 64];
-        let mut tmp_u16 = vec![0u16; 2 * n];
+        let mut tmp_u16 = [0u16; DOUBLE];
 
         // Decode f, g, F from the key
         let nbits_fg = match logn {
@@ -1150,7 +1152,7 @@ pub mod eth_falcon {
 
         // Compute G from f, g, F
         // G = g*F/f mod q
-        let (w0, w1) = tmp_u16.split_at_mut(n);
+        let (w0, w1) = tmp_u16.split_at_mut(N);
 
         // w0 <- g/f (NTT)
         mq::mqpoly_small_to_int(logn, &g, w0);
@@ -1170,7 +1172,7 @@ pub mod eth_falcon {
         mq::mqpoly_NTT_to_int(logn, w0);
         mq::mqpoly_int_to_ext(logn, w0);
         vrfy_key[0] = 0x00 + (logn as u8);
-        let j = 1 + codec::modq_encode(&w0[..n], &mut vrfy_key[1..]);
+        let j = 1 + codec::modq_encode(&w0[..N], &mut vrfy_key[1..]);
         if j != vrfy_key.len() {
             return Err("Public key encoding length mismatch");
         }
@@ -1188,7 +1190,7 @@ pub mod eth_falcon {
         }
 
         // Compute the basis B = [[g, -f], [G, -F]] in FFT format
-        let mut basis = vec![super::flr::FLR::ZERO; 4 * n];
+        let mut basis = [super::flr::FLR::ZERO; QUAD];
         compute_basis_inner(logn, &f, &g, &F, &G, &mut basis);
 
         Ok((logn, f, g, F, G, basis))
