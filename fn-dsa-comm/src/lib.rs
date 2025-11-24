@@ -222,13 +222,89 @@ pub fn hash_to_point(
     }
 }
 
+/// A generic hash to point method
+pub trait HashToPoint: Copy + Clone {
+    /// Hash a message into a polynomial modulo q = 12289.
+    ///
+    /// Parameters are:
+    ///
+    ///  - `rng`:              Random number generator used if needed
+    ///  - `hashed_vrfy_key`:  SHAKE256 hash of public (verifying) key (64 bytes)
+    ///  - `ctx`:              domain separation context
+    ///  - `id`:               identifier for pre-hash function
+    ///  - `hv`:               message (pre-hashed)
+    ///  - `c`:                output polynomial
+    ///
+    /// If `id` is `HASH_ID_RAW`, then no-prehashing is applied and the message
+    /// itself should be provided as `hv`. Otherwise, the caller is responsible
+    /// for applying the pre-hashing, and `hv` shall be the hashed message.
+    fn hash_to_point<R: CryptoRng + RngCore>(
+        &mut self,
+        rng: &mut R,
+        hashed_vrfy_key: &[u8],
+        ctx: &DomainContext,
+        id: &HashIdentifier,
+        hv: &[u8],
+        c: &mut [u16],
+    );
+
+    /// The nonce used for signing
+    fn nonce(&self) -> &[u8];
+}
+
+/// The default hash to point implementation
+#[derive(Copy, Clone, Debug)]
+pub struct DefaultHashToPoint {
+    first: bool,
+    orig_falcon: bool,
+    nonce: [u8; 40],
+}
+
+impl Default for DefaultHashToPoint {
+    fn default() -> Self {
+        DefaultHashToPoint {
+            first: true,
+            orig_falcon: false,
+            nonce: [0u8; 40],
+        }
+    }
+}
+
+impl HashToPoint for DefaultHashToPoint {
+    fn hash_to_point<R: CryptoRng + RngCore>(
+        &mut self,
+        rng: &mut R,
+        hashed_vrfy_key: &[u8],
+        ctx: &DomainContext,
+        id: &HashIdentifier,
+        hv: &[u8],
+        c: &mut [u16],
+    ) {
+        if self.first || !self.orig_falcon {
+            rng.fill_bytes(&mut self.nonce);
+            hash_to_point(&self.nonce, hashed_vrfy_key, ctx, id, hv, c);
+            self.first = false;
+
+            // TODO: remove when switching to final test vectors.
+            self.orig_falcon = id.0.len() == 1 && id.0[0] == 0xFF;
+        }
+    }
+
+    fn nonce(&self) -> &[u8] {
+        &self.nonce
+    }
+}
+
 #[cfg(feature = "eth_falcon")]
 /// Support for ETHFALCON methods
 pub mod eth_falcon {
     extern crate alloc;
-    use super::{codec, mq, vrfy_key_size, FN_DSA_LOGN_512};
+    use super::{
+        codec, mq, vrfy_key_size, DomainContext, HashIdentifier, HashToPoint, FN_DSA_LOGN_512,
+    };
 
     use alloc::vec::Vec;
+    use rand_core::{CryptoRng, RngCore};
     use tiny_keccak::{Hasher, Keccak};
 
     const KECCAK_OUTPUT: usize = 32;
@@ -241,6 +317,42 @@ pub mod eth_falcon {
 
     /// The required length for salts
     pub const SALT_LEN: usize = 40;
+
+    // Q = 12289, which is less than 2^16 = 65536, so this is always true
+    // Removed the runtime check to avoid overflow warning
+    const Q: usize = 12289;
+    const N: usize = 512;
+
+    /// KeccakXOF implements the Keccak PRNG as used in ETHFALCON
+    #[derive(Clone, Copy, Debug)]
+    pub struct EthFalconHashToPoint {
+        salt: [u8; SALT_LEN],
+    }
+
+    impl EthFalconHashToPoint {
+        /// Create a new hasher
+        pub fn new(salt: [u8; SALT_LEN]) -> EthFalconHashToPoint {
+            Self { salt }
+        }
+    }
+
+    impl HashToPoint for EthFalconHashToPoint {
+        fn hash_to_point<R: CryptoRng + RngCore>(
+            &mut self,
+            _rng: &mut R,
+            _hashed_vrfy_key: &[u8],
+            _ctx: &DomainContext,
+            _id: &HashIdentifier,
+            hv: &[u8],
+            c: &mut [u16],
+        ) {
+            hash_to_point_keccak(N, hv, &self.salt, c)
+        }
+
+        fn nonce(&self) -> &[u8] {
+            &self.salt
+        }
+    }
 
     /// KeccakXOF implements the Keccak PRNG as used in ETHFALCON
     /// This replaces SHAKE256 in standard Falcon
@@ -262,23 +374,16 @@ pub mod eth_falcon {
     impl KeccakXOF {
         /// Inject (absorb) data into XOF state
         /// This is called "update" in the SHAKE256 interface
-        pub fn update(&mut self, data: &[u8]) -> Result<(), &'static str> {
-            if self.finalized {
-                return Err("Cannot update after finalizing");
-            }
-
+        pub fn update(&mut self, data: &[u8]) {
+            assert!(!self.finalized, "Cannot update after finalizing");
             // Use dynamic buffer - no size limit
             self.buffer.extend_from_slice(data);
-
-            Ok(())
         }
 
         /// Finalize the XOF state and prepare for output generation
         /// This is called "flip" in the XOF interface
-        pub fn flip(&mut self) -> Result<(), &'static str> {
-            if self.finalized {
-                return Err("Already finalized");
-            }
+        pub fn flip(&mut self) {
+            assert!(!self.finalized, "Cannot flip after finalizing");
 
             // Hash the buffer to create initial state
             let mut keccak = Keccak::v256();
@@ -290,43 +395,38 @@ pub mod eth_falcon {
             // Reset output buffer
             self.out_buffer_pos = 0;
             self.out_buffer_len = 0;
-
-            Ok(())
         }
 
         /// Extract (squeeze) output from the XOF
         /// This is called "read" in the XOF interface
-        pub fn read(&mut self, length: usize) -> Result<Vec<u8>, &'static str> {
-            if !self.finalized {
-                return Err("XOF not finalized");
-            }
+        pub fn read(&mut self, output: &mut [u8]) {
+            assert!(self.finalized, "XOF not finalized");
 
-            let mut output = Vec::with_capacity(length);
             let mut offset = 0;
 
             // First, use any bytes remaining in the output buffer
             if self.out_buffer_len > self.out_buffer_pos {
                 let available = self.out_buffer_len - self.out_buffer_pos;
-                let to_copy = core::cmp::min(length, available);
+                let to_copy = core::cmp::min(output.len(), available);
 
-                output.extend_from_slice(
+                output[offset..offset + to_copy].copy_from_slice(
                     &self.out_buffer[self.out_buffer_pos..self.out_buffer_pos + to_copy],
                 );
                 self.out_buffer_pos += to_copy;
                 offset += to_copy;
 
                 // If we've satisfied the request, return early
-                if offset == length {
-                    return Ok(output);
+                if offset >= output.len() {
+                    return;
                 }
             }
 
             // Generate more output blocks as needed
-            while offset < length {
+            while offset < output.len() {
                 // Prepare input block: state || counter (big-endian)
-                let mut block = Vec::with_capacity(KECCAK_OUTPUT + 8);
-                block.extend_from_slice(&self.state);
-                block.extend_from_slice(&self.counter.to_be_bytes());
+                let mut block = [0u8; KECCAK_OUTPUT + 8];
+                block[..KECCAK_OUTPUT].copy_from_slice(&self.state);
+                block[KECCAK_OUTPUT..].copy_from_slice(&self.counter.to_be_bytes());
 
                 // Generate next block using Keccak-256
                 let mut keccak = Keccak::v256();
@@ -338,18 +438,16 @@ pub mod eth_falcon {
                 self.out_buffer_pos = 0;
 
                 // Copy output
-                let remaining = length - offset;
+                let remaining = output.len() - offset;
                 let to_copy = core::cmp::min(remaining, KECCAK_OUTPUT);
 
-                output.extend_from_slice(&self.out_buffer[..to_copy]);
+                output[offset..offset + to_copy].copy_from_slice(&self.out_buffer[..to_copy]);
                 self.out_buffer_pos = to_copy;
                 offset += to_copy;
 
                 // Increment counter for next block
                 self.counter += 1;
             }
-
-            Ok(output)
         }
 
         /// Reset the XOF to initial state (for future use)
@@ -375,15 +473,10 @@ pub mod eth_falcon {
     ///
     /// Returns:
     ///     A vector of n coefficients in [0, q)
-    pub fn hash_to_point_keccak(
-        n: usize,
-        message: &[u8],
-        salt: &[u8],
-    ) -> Result<Vec<u16>, &'static str> {
-        // Q = 12289, which is less than 2^16 = 65536, so this is always true
-        // Removed the runtime check to avoid overflow warning
-        const Q: usize = 12289;
+    pub fn hash_to_point_keccak(n: usize, message: &[u8], salt: &[u8], c: &mut [u16]) {
         const K: u32 = (1u32 << 16) / (Q as u32);
+
+        assert_eq!(c.len(), n);
 
         // Create XOF and hash the inputs
         // Note: In ETHFALCON/KeccakPRNG mode, the order is reversed compared to SHAKE256
@@ -391,36 +484,28 @@ pub mod eth_falcon {
         let mut xof = KeccakXOF::default();
 
         // ETHFALCON uses message first, then salt (reversed from SHAKE256)
-        xof.update(message)
-            .map_err(|_| "Failed to update XOF with message")?;
-        xof.update(salt)
-            .map_err(|_| "Failed to update XOF with salt")?;
+        xof.update(message);
+        xof.update(salt);
 
-        xof.flip().map_err(|_| "Failed to finalize XOF")?;
+        xof.flip();
 
         // Output pseudorandom coefficients using rejection sampling
-        let mut hashed = Vec::with_capacity(n);
         let mut i = 0;
+        let mut two_bytes = [0u8; 2];
 
         while i < n {
             // Read 2 bytes and interpret as a 16-bit integer
-            let two_bytes = xof.read(2).map_err(|_| "Failed to read from XOF")?;
-
-            if two_bytes.len() != 2 {
-                return Err("Insufficient bytes from XOF");
-            }
+            xof.read(&mut two_bytes);
 
             // Big-endian: (byte[0] << 8) + byte[1]
             let elt = ((two_bytes[0] as u32) << 8) + (two_bytes[1] as u32);
 
             // Rejection sampling: accept if elt < k * q
             if elt < K * (Q as u32) {
-                hashed.push((elt % (Q as u32)) as u16);
+                c[i] = (elt % (Q as u32)) as u16;
                 i += 1;
             }
         }
-
-        Ok(hashed)
     }
 
     /// Decode a Falcon public key to NTT abi.encodePacked format
@@ -444,19 +529,12 @@ pub mod eth_falcon {
         let header = pubkey[0];
         let logn = (header & 0x0F) as u32;
 
-        if logn != FN_DSA_LOGN_512 {
-            return Err("Only Falcon-512 (logn=9) supported");
-        }
-
         if pubkey.len() != vrfy_key_size(logn) {
             return Err("Invalid public key length");
         }
 
-        // let n = 1usize << logn; // 512
-        assert_eq!(1usize << logn, 512);
-
         // Decode h from compressed format
-        let mut h = [0u16; 512];
+        let mut h = [0u16; N];
         codec::modq_decode(&pubkey[1..], &mut h).ok_or("Failed to decode public key")?;
 
         // Convert h to NTT form
@@ -465,25 +543,8 @@ pub mod eth_falcon {
 
         // Convert h_ntt to abi.encodePacked(uint256[32]) format
         // 512 coefficients → 32 uint256 (16 coefficients per uint256, LSB-first)
-        let mut packed = [0u8; 1024];
-
-        for chunk_idx in 0..32 {
-            let mut value = [0u8; 32]; // Big-endian uint256
-
-            // Pack 16 coefficients into this uint256 (LSB-first)
-            for coeff_idx in 0..16 {
-                let h_idx = chunk_idx * 16 + coeff_idx;
-                let coeff = h[h_idx];
-
-                // Pack into uint256 at correct position (rightmost = coeff 0)
-                let byte_offset = 30 - (coeff_idx * 2); // Rightmost bytes first
-                value[byte_offset] = (coeff >> 8) as u8;
-                value[byte_offset + 1] = coeff as u8;
-            }
-
-            // Copy to output
-            packed[chunk_idx * 32..(chunk_idx + 1) * 32].copy_from_slice(&value);
-        }
+        let mut packed = [0u8; PUBKEY_NTT_PACKED_LENGTH];
+        decode(logn, &h, &mut packed)?;
 
         Ok(packed)
     }
@@ -507,50 +568,56 @@ pub mod eth_falcon {
         let header = signature[0];
         let logn = (header & 0x0F) as u32;
 
-        if logn != FN_DSA_LOGN_512 {
-            return Err("Only Falcon-512 (logn=9) supported");
-        }
-
-        // let n = 1usize << logn; // 512
-        assert_eq!(1usize << logn, 512);
         let compressed_s2 = &signature[41..];
 
         // Decompress s2 using fn-dsa's codec
-        let mut s2 = [0i16; 512];
+        let mut s2 = [0i16; N];
         if !codec::comp_decode(compressed_s2, &mut s2) {
             return Err("Failed to decompress signature");
+        }
+        let mut s2_u16 = [0u16; N];
+        for (c, &coeff) in s2_u16.iter_mut().zip(s2.iter()) {
+            // Convert signed i16 to unsigned u16 (mod q)
+            *c = if coeff < 0 {
+                (Q as i32 + coeff as i32) as u16
+            } else {
+                coeff as u16
+            };
         }
 
         // Convert s2 to abi.encodePacked(uint256[32]) format
         // 512 coefficients → 32 uint256 (16 coefficients per uint256, LSB-first)
         let mut packed = [0u8; SIGNATURE_ABI_PACKED_LENGTH];
+        decode(logn, &s2_u16, &mut packed)?;
+
+        Ok(packed)
+    }
+
+    fn decode(logn: u32, coefficients: &[u16], packed: &mut [u8]) -> Result<(), &'static str> {
+        if logn != FN_DSA_LOGN_512 {
+            return Err("Only Falcon-512 (logn=9) supported");
+        }
+        assert_eq!(1usize << logn, N);
 
         for chunk_idx in 0..32 {
             let mut value = [0u8; 32]; // Big-endian uint256
 
             // Pack 16 coefficients into this uint256 (LSB-first)
             for coeff_idx in 0..16 {
-                let s2_idx = chunk_idx * 16 + coeff_idx;
-                let coeff = s2[s2_idx];
-
-                // Convert signed i16 to unsigned u16 (mod q)
-                let coeff_u16 = if coeff < 0 {
-                    (12289 + coeff as i32) as u16
-                } else {
-                    coeff as u16
-                };
+                let h_idx = chunk_idx * 16 + coeff_idx;
+                let coeff = coefficients[h_idx];
 
                 // Pack into uint256 at correct position (rightmost = coeff 0)
                 let byte_offset = 30 - (coeff_idx * 2); // Rightmost bytes first
-                value[byte_offset] = (coeff_u16 >> 8) as u8;
-                value[byte_offset + 1] = coeff_u16 as u8;
+                value[byte_offset] = (coeff >> 8) as u8;
+                value[byte_offset + 1] = coeff as u8;
             }
 
             // Copy to output
             packed[chunk_idx * 32..(chunk_idx + 1) * 32].copy_from_slice(&value);
         }
 
-        Ok(packed)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -560,15 +627,17 @@ pub mod eth_falcon {
         #[test]
         fn test_deterministic_32_bytes() {
             let mut xof = KeccakXOF::default();
-            xof.update(b"test input").unwrap();
-            xof.flip().unwrap();
-            let output = xof.read(32).unwrap();
+            xof.update(b"test input");
+            xof.flip();
+            let mut output = [0u8; 32];
+            xof.read(&mut output);
 
             let expected =
                 hex::decode("5b9e99370fa4b753ac6bf0d246b3cec353c84a67839f5632cb2679b4ae565601")
                     .unwrap();
             assert_eq!(
-                output, expected,
+                &output[..],
+                expected,
                 "KeccakPRNG output mismatch for 'test input' (32 bytes)"
             );
         }
@@ -576,9 +645,10 @@ pub mod eth_falcon {
         #[test]
         fn test_deterministic_64_bytes_second_half() {
             let mut xof = KeccakXOF::default();
-            xof.update(b"test input").unwrap();
-            xof.flip().unwrap();
-            let output = xof.read(64).unwrap();
+            xof.update(b"test input");
+            xof.flip();
+            let mut output = [0u8; 64];
+            xof.read(&mut output);
 
             // Check the second half (bytes 32-64)
             let expected_second_half =
@@ -594,15 +664,17 @@ pub mod eth_falcon {
         #[test]
         fn test_testinput_no_space() {
             let mut xof = KeccakXOF::default();
-            xof.update(b"testinput").unwrap();
-            xof.flip().unwrap();
-            let output = xof.read(32).unwrap();
+            xof.update(b"testinput");
+            xof.flip();
+            let mut output = [0u8; 32];
+            xof.read(&mut output);
 
             let expected =
                 hex::decode("120f76b5b7198706bc294a942f8d17467aadb2bb1fa2cc1fecadbaba93c0dd74")
                     .unwrap();
             assert_eq!(
-                output, expected,
+                &output[..],
+                expected,
                 "KeccakPRNG output mismatch for 'testinput'"
             );
         }
@@ -611,16 +683,18 @@ pub mod eth_falcon {
         fn test_incremental_inject() {
             // Inject "testinput" as one chunk
             let mut xof1 = KeccakXOF::default();
-            xof1.update(b"testinput").unwrap();
-            xof1.flip().unwrap();
-            let output1 = xof1.read(32).unwrap();
+            xof1.update(b"testinput");
+            xof1.flip();
+            let mut output1 = [0u8; 32];
+            xof1.read(&mut output1);
 
             // Inject "test" then "input" as two chunks
             let mut xof2 = KeccakXOF::default();
-            xof2.update(b"test").unwrap();
-            xof2.update(b"input").unwrap();
-            xof2.flip().unwrap();
-            let output2 = xof2.read(32).unwrap();
+            xof2.update(b"test");
+            xof2.update(b"input");
+            xof2.flip();
+            let mut output2 = [0u8; 32];
+            xof2.read(&mut output2);
 
             assert_eq!(
                 output1, output2,
@@ -631,20 +705,24 @@ pub mod eth_falcon {
         #[test]
         fn test_multiple_extractions() {
             let mut xof = KeccakXOF::default();
-            xof.update(b"test sequence").unwrap();
-            xof.flip().unwrap();
+            xof.update(b"test sequence");
+            xof.flip();
 
-            let output1 = xof.read(16).unwrap();
-            let output2 = xof.read(16).unwrap();
-            let output3 = xof.read(16).unwrap();
+            let mut output1 = [0u8; 16];
+            let mut output2 = [0u8; 16];
+            let mut output3 = [0u8; 16];
+
+            xof.read(&mut output1);
+            xof.read(&mut output2);
+            xof.read(&mut output3);
 
             let expected1 = hex::decode("9e96b1e50719da6f0ea5b664ac8bbac5").unwrap();
             let expected2 = hex::decode("eb409b4db770b124363b393a0c96b5d6").unwrap();
             let expected3 = hex::decode("1be071eca45961aca979e88e3784a751").unwrap();
 
-            assert_eq!(output1, expected1, "First extraction mismatch");
-            assert_eq!(output2, expected2, "Second extraction mismatch");
-            assert_eq!(output3, expected3, "Third extraction mismatch");
+            assert_eq!(&output1[..], expected1, "First extraction mismatch");
+            assert_eq!(&output2[..], expected2, "Second extraction mismatch");
+            assert_eq!(&output3[..], expected3, "Third extraction mismatch");
 
             // All three should be different
             assert_ne!(output1, output2);
@@ -655,16 +733,19 @@ pub mod eth_falcon {
         #[test]
         fn test_extract_2_2_vs_4() {
             let mut xof1 = KeccakXOF::default();
-            xof1.update(b"Danette").unwrap();
-            xof1.flip().unwrap();
-            let out1a = xof1.read(2).unwrap();
-            let out1b = xof1.read(2).unwrap();
+            xof1.update(b"Danette");
+            xof1.flip();
+            let mut out1a = [0u8; 2];
+            let mut out1b = [0u8; 2];
+            xof1.read(&mut out1a);
+            xof1.read(&mut out1b);
             let combined1 = [&out1a[..], &out1b[..]].concat();
 
             let mut xof2 = KeccakXOF::default();
-            xof2.update(b"Danette").unwrap();
-            xof2.flip().unwrap();
-            let out2 = xof2.read(4).unwrap();
+            xof2.update(b"Danette");
+            xof2.flip();
+            let mut out2 = [0u8; 4];
+            xof2.read(&mut out2);
 
             assert_eq!(combined1, out2, "Reading 2+2 should equal reading 4");
         }

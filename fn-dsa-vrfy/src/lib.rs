@@ -102,7 +102,7 @@ pub trait VerifyingKey: Sized {
 macro_rules! vrfy_key_impl {
     ($typename:ident, $logn_min:expr, $logn_max:expr) => {
         #[doc = concat!("Signature verifier for degrees (`logn`) ",
-                        stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
+                                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
         #[derive(Copy, Clone, Debug)]
         pub struct $typename {
             logn: u32,
@@ -276,32 +276,9 @@ fn verify_inner(
         return false;
     }
 
-    // norm2 <- squared norm of s2. Note that successful decoding implies
-    // that every coefficient is at most 2047 (in absolute value); hence,
-    // the maximum squared norm is at most 1024*(2047^2) < 2^32.
-    let norm2 = mq::signed_poly_sqnorm(logn, &*s2i);
-
     // t1 <- c = hashed message (internal format)
     hash_to_point(&sig[1..41], hashed_key, ctx, id, hv, t1);
-    mq::mqpoly_ext_to_int(logn, t1);
-
-    // t2 <- s2 (NTT format)
-    mq::mqpoly_signed_to_ext(logn, &*s2i, t2);
-    mq::mqpoly_ext_to_int(logn, t2);
-    mq::mqpoly_int_to_NTT(logn, t2);
-
-    // t1 <- s1 = c - s2*h (external format)
-    mq::mqpoly_mul_ntt(logn, t2, h);
-    mq::mqpoly_NTT_to_int(logn, t2);
-    mq::mqpoly_sub_int(logn, t1, t2);
-    mq::mqpoly_int_to_ext(logn, t1);
-
-    // norm1 <- squared norm of s1
-    let norm1 = mq::mqpoly_sqnorm(logn, &*t1);
-
-    // Signature is valid if the total squared norm of (s1,s2) is small
-    // enough. We must take care of not overflowing.
-    norm1 < norm2.wrapping_neg() && (norm1 + norm2) <= mq::SQBETA[logn as usize]
+    verify_last_part(logn, h, &*s2i, t1, t2)
 }
 
 // AVX2-optimized implementation of key decoding.
@@ -380,7 +357,7 @@ unsafe fn verify_avx2_inner(
     // norm2 <- squared norm of s2. Note that successful decoding implies
     // that every coefficient is at most 2047 (in absolute value); hence,
     // the maximum squared norm is at most 1024*(2047^2) < 2^32.
-    let norm2 = mq_avx2::signed_poly_sqnorm(logn, &*s2i);
+    // let norm2 = mq_avx2::signed_poly_sqnorm(logn, &*s2i);
 
     // t1 <- c = hashed message (internal format)
     hash_to_point(&sig[1..41], hashed_key, ctx, id, hv, t1);
@@ -405,6 +382,33 @@ unsafe fn verify_avx2_inner(
     norm1 < norm2.wrapping_neg() && (norm1 + norm2) <= mq_avx2::SQBETA[logn as usize]
 }
 
+fn verify_last_part(logn: u32, h: &[u16], s2i: &[i16], t1: &mut [u16], t2: &mut [u16]) -> bool {
+    // norm2 <- squared norm of s2. Note that successful decoding implies
+    // that every coefficient is at most 2047 (in absolute value); hence,
+    // the maximum squared norm is at most 1024*(2047^2) < 2^32.
+    let norm2 = mq::signed_poly_sqnorm(logn, s2i);
+
+    mq::mqpoly_ext_to_int(logn, t1);
+
+    // t2 <- s2 (NTT format)
+    mq::mqpoly_signed_to_ext(logn, s2i, t2);
+    mq::mqpoly_ext_to_int(logn, t2);
+    mq::mqpoly_int_to_NTT(logn, t2);
+
+    // t1 <- s1 = c - s2*h (external format)
+    mq::mqpoly_mul_ntt(logn, t2, h);
+    mq::mqpoly_NTT_to_int(logn, t2);
+    mq::mqpoly_sub_int(logn, t1, t2);
+    mq::mqpoly_int_to_ext(logn, t1);
+
+    // norm1 <- squared norm of s1
+    let norm1 = mq::mqpoly_sqnorm(logn, &*t1);
+
+    // Signature is valid if the total squared norm of (s1,s2) is small
+    // enough. We must take care of not overflowing.
+    norm1 < norm2.wrapping_neg() && (norm1 + norm2) <= mq::SQBETA[logn as usize]
+}
+
 #[cfg(feature = "eth_falcon")]
 /// Support for verifying ETHFALCON signatures
 pub mod eth_falcon {
@@ -415,86 +419,84 @@ pub mod eth_falcon {
 
     /// Falcon-512 parameters
     const N: usize = 512;
-    const LOGN: u32 = 9;
 
-    /// Verify an ETHFALCON signature
-    ///
-    /// This is the core Rust API that accepts raw byte slices.
-    /// All inputs are Solidity abi.encodePacked(uint256[32]) format (1024 bytes each).
-    ///
-    /// # Arguments
-    /// * `message` - The message bytes (any length)
-    /// * `salt` - 40-byte random salt from signature
-    /// * `s2_packed` - Signature s2 in abi.encodePacked format (1024 bytes)
-    /// * `pk_ntt_packed` - Public key h in NTT form, abi.encodePacked format (1024 bytes)
-    ///
-    /// # Returns
-    /// * `Ok(true)` if signature is valid
-    /// * `Ok(false)` if signature is invalid
-    /// * `Err` if inputs are malformed
-    pub fn verify(
-        message: &[u8],
-        salt: &[u8; SALT_LEN],
-        s2_packed: &[u8; SIGNATURE_ABI_PACKED_LENGTH],
-        pk_ntt_packed: &[u8; PUBKEY_NTT_PACKED_LENGTH],
-    ) -> Result<bool, &'static str> {
-        // Validate inputs
-        if salt.len() != SALT_LEN {
-            return Err("Salt must be exactly 40 bytes");
+    #[derive(Copy, Clone, Debug)]
+    pub struct EthFalconVerifyingKey {
+        h: [u16; N],
+    }
+
+    impl Default for EthFalconVerifyingKey {
+        fn default() -> Self {
+            Self { h: [0u16; N] }
+        }
+    }
+
+    impl TryFrom<&[u8]> for EthFalconVerifyingKey {
+        type Error = &'static str;
+
+        fn try_from(pk_ntt_packed: &[u8]) -> Result<Self, Self::Error> {
+            let pk_ntt_packed = <[u8; PUBKEY_NTT_PACKED_LENGTH]>::try_from(pk_ntt_packed)
+                .map_err(|_| "Invalid length PK NTT packed bytes")?;
+            Ok(Self::decode(&pk_ntt_packed))
+        }
+    }
+
+    impl EthFalconVerifyingKey {
+        /// Decode the NTT packed public key into a verifying key
+        pub fn decode(pk_ntt_packed: &[u8; PUBKEY_NTT_PACKED_LENGTH]) -> Self {
+            Self {
+                h: parse_abi_packed_u16(pk_ntt_packed),
+            }
         }
 
-        // Parse abi.encodePacked inputs
-        let s2_coeffs = parse_abi_packed_i16(s2_packed)?;
-        let h_ntt_coeffs = parse_abi_packed_u16(pk_ntt_packed)?;
+        /// Verify an ETHFALCON signature
+        ///
+        /// This is the core Rust API that accepts raw byte slices.
+        /// All inputs are Solidity abi.encodePacked(uint256[32]) format (1024 bytes each).
+        ///
+        /// # Arguments
+        /// * `message` - The message bytes (any length)
+        /// * `salt` - 40-byte random salt from signature
+        /// * `s2_packed` - Signature s2 in abi.encodePacked format (1024 bytes)
+        /// * `pk_ntt_packed` - Public key h in NTT form, abi.encodePacked format (1024 bytes)
+        ///
+        /// # Returns
+        /// * `Ok(true)` if signature is valid
+        /// * `Ok(false)` if signature is invalid
+        /// * `Err` if inputs are malformed
+        pub fn verify(
+            &self,
+            message: &[u8],
+            salt: &[u8; SALT_LEN],
+            s2_packed: &[u8; SIGNATURE_ABI_PACKED_LENGTH],
+        ) -> bool {
+            // Parse abi.encodePacked inputs
+            let s2_coeffs = parse_abi_packed_i16(s2_packed);
 
-        // Step 1: Hash message to point using Keccak XOF (replaces SHAKE256)
-        let mut hashed = hash_to_point_keccak(N, message, salt)?;
-
-        // Step 2: Compute squared norm of s2
-        let norm_s2 = mq::signed_poly_sqnorm(LOGN, &s2_coeffs);
-
-        // Step 3: Convert hashed to internal format
-        mq::mqpoly_ext_to_int(LOGN, &mut hashed);
-
-        // Step 4: Convert s2 to NTT format
-        let mut s2_ext = [0u16; N];
-        mq::mqpoly_signed_to_ext(LOGN, &s2_coeffs, &mut s2_ext);
-        mq::mqpoly_ext_to_int(LOGN, &mut s2_ext);
-        mq::mqpoly_int_to_NTT(LOGN, &mut s2_ext);
-
-        // Step 5: Multiply s2 * h in NTT domain (O(n) operation)
-        let mut s2h_ntt = s2_ext.clone();
-        mq::mqpoly_mul_ntt(LOGN, &mut s2h_ntt, &h_ntt_coeffs);
-
-        // Step 6: Convert back from NTT
-        mq::mqpoly_NTT_to_int(LOGN, &mut s2h_ntt);
-
-        // Step 7: Compute s1 = c - s2*h
-        mq::mqpoly_sub_int(LOGN, &mut hashed, &s2h_ntt);
-
-        // Step 8: Convert s1 to external format for norm computation
-        mq::mqpoly_int_to_ext(LOGN, &mut hashed);
-
-        // Step 9: Compute squared norm of s1
-        let norm_s1 = mq::mqpoly_sqnorm(LOGN, &hashed);
-
-        // Step 10: Check signature bound
-        // Valid if ||s1||^2 + ||s2||^2 <= SQBETA
-        // Must avoid overflow
-        let valid =
-            norm_s1 < norm_s2.wrapping_neg() && (norm_s1 + norm_s2) <= mq::SQBETA[LOGN as usize];
-
-        Ok(valid)
+            // Step 1: Hash message to point using Keccak XOF (replaces SHAKE256)
+            let mut hashed = [0u16; N];
+            let mut s2_ext = [0u16; N];
+            hash_to_point_keccak(N, message, salt, &mut hashed);
+            verify_last_part(
+                FN_DSA_LOGN_512,
+                &self.h,
+                &s2_coeffs,
+                &mut hashed,
+                &mut s2_ext,
+            )
+        }
     }
 
     /// Parse Solidity abi.encodePacked(uint256[32]) format to u16 coefficients
     ///
     /// Solidity stores coefficients in uint256[32] where each uint256 contains 16 coefficients
     /// packed LSB-first. abi.encodePacked outputs this as 1024 bytes (32 × 32 bytes, big-endian).
-    fn parse_abi_packed_u16(data: &[u8]) -> Result<[u16; N], &'static str> {
-        if data.len() != 1024 {
-            return Err("abi.encodePacked(uint256[32]) must be 1024 bytes");
-        }
+    fn parse_abi_packed_u16(data: &[u8]) -> [u16; N] {
+        assert_eq!(
+            data.len(),
+            1024,
+            "abi.encodePacked(uint256[32]) must be 1024 bytes"
+        );
 
         let mut coeffs = [0u16; N];
         let mut coeff_iter = 0;
@@ -512,15 +514,15 @@ pub mod eth_falcon {
             }
         }
 
-        Ok(coeffs)
+        coeffs
     }
 
     /// Parse Solidity abi.encodePacked(uint256[32]) format to signed i16 coefficients
     ///
     /// Values > Q/2 are normalized to negative (mod Q arithmetic)
-    fn parse_abi_packed_i16(data: &[u8]) -> Result<[i16; N], &'static str> {
+    fn parse_abi_packed_i16(data: &[u8]) -> [i16; N] {
         const Q: u16 = 12289;
-        let u16_coeffs = parse_abi_packed_u16(data)?;
+        let u16_coeffs = parse_abi_packed_u16(data);
         let mut i16_coeffs = [0i16; N];
         for (i, &coeff_u16) in i16_coeffs.iter_mut().zip(u16_coeffs.iter()) {
             *i = if coeff_u16 > Q / 2 {
@@ -530,7 +532,7 @@ pub mod eth_falcon {
             }
         }
 
-        Ok(i16_coeffs)
+        i16_coeffs
     }
 
     #[cfg(test)]
@@ -545,9 +547,11 @@ pub mod eth_falcon {
             let s2_packed = [0u8; SIGNATURE_ABI_PACKED_LENGTH]; // abi.encodePacked format
             let pk_ntt_packed = [0u8; PUBKEY_NTT_PACKED_LENGTH]; // abi.encodePacked format
 
+            let vrfy_key = EthFalconVerifyingKey::decode(&pk_ntt_packed);
+
             // This will fail validation (zero signature), but should not panic
-            let result = verify(message, &salt, &s2_packed, &pk_ntt_packed);
-            assert!(result.is_ok());
+            let result = vrfy_key.verify(message, &salt, &s2_packed);
+            assert!(!result);
         }
 
         #[test]
@@ -585,22 +589,15 @@ pub mod eth_falcon {
 
             let salt = <[u8; SALT_LEN]>::try_from(salt).unwrap();
             let s2_packed = <[u8; SIGNATURE_ABI_PACKED_LENGTH]>::try_from(s2_packed).unwrap();
-            let pk_ntt_packed = <[u8; PUBKEY_NTT_PACKED_LENGTH]>::try_from(pk_ntt_packed).unwrap();
+            let vrfy_key = EthFalconVerifyingKey::try_from(pk_ntt_packed.as_slice()).unwrap();
 
             // Call the verification function with raw byte slices
-            let result = verify(message, &salt, &s2_packed, &pk_ntt_packed);
+            let valid = vrfy_key.verify(message, &salt, &s2_packed);
 
-            match result {
-                Ok(valid) => {
-                    assert!(
-                        valid,
-                        "Verification should succeed for valid signature from Solidity test"
-                    );
-                }
-                Err(e) => {
-                    panic!("Verification failed with error: {}", e);
-                }
-            }
+            assert!(
+                valid,
+                "Verification should succeed for valid signature from Solidity test"
+            );
         }
     }
 }

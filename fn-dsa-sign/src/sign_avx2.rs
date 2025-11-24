@@ -2,6 +2,7 @@
 #![allow(non_upper_case_globals)]
 
 use super::*;
+use core::hash::Hash;
 use fn_dsa_comm::mq_avx2;
 
 #[path = "poly_avx2.rs"]
@@ -148,8 +149,9 @@ pub(crate) unsafe fn compute_basis_avx2_inner(
 // This is a specialized version of sign_inner() (defined in the parent
 // module); it leverages AVX2 intrinsics to speed up operations.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG>(
+pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG, H: HashToPoint>(
     logn: u32,
+    mut hasher: H,
     rng: &mut T,
     f: &[i8],
     g: &[i8],
@@ -174,12 +176,12 @@ pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG>(
 
     // Special behaviour for the original Falcon algorithm (for test
     // reproducibility). TODO: remove when switching to final test vectors.
-    let orig_falcon = id.0.len() == 1 && id.0[0] == 0xFF;
+    // let orig_falcon = id.0.len() == 1 && id.0[0] == 0xFF;
 
     // Hash the message with a 40-byte random nonce, to produce the
     // hashed message.
-    let mut nonce = [0u8; 40];
-    let mut first = true;
+    // let mut nonce = [0u8; 40];
+    // let mut first = true;
 
     // Usually the signature generation works at the first attempt, but
     // occasionally we need to try again because the obtained signature
@@ -191,12 +193,13 @@ pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG>(
         // message to a polynomial hm[].
         // In the original Falcon, this was done once; in FN-DSA, this
         // is done at each loop restart.
-        // (TODO: align with final spec)
-        if first || !orig_falcon {
-            rng.fill_bytes(&mut nonce);
-            hash_to_point(&nonce, hashed_vrfy_key, ctx, id, hv, hm);
-            first = false;
-        }
+        // // (TODO: align with final spec)
+        // if first || !orig_falcon {
+        //     rng.fill_bytes(&mut nonce);
+        //     hash_to_point(&nonce, hashed_vrfy_key, ctx, id, hv, hm);
+        //     first = false;
+        // }
+        hasher.hash_to_point(rng, hashed_vrfy_key, ctx, id, hv, hm);
 
         // We initialize the PRNG with a 56-byte seed, to match the
         // practice from the C code (it makes it simpler to reproduce

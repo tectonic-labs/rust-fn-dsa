@@ -63,7 +63,7 @@ mod flr;
 mod poly;
 mod sampler;
 
-use fn_dsa_comm::{codec, hash_to_point, mq, shake, PRNG};
+use fn_dsa_comm::{codec, mq, shake, DefaultHashToPoint, HashToPoint, PRNG};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // Re-export useful types, constants and functions.
@@ -129,7 +129,7 @@ pub trait SigningKey: Sized {
 macro_rules! sign_key_impl {
     ($typename:ident, $logn_min:expr, $logn_max:expr) => {
         #[doc = concat!("Signature generator for degrees (`logn`) ",
-                        stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
+                                stringify!($logn_min), " to ", stringify!($logn_max), " only.")]
         #[derive(Zeroize, ZeroizeOnDrop)]
         pub struct $typename {
             f: [i8; 1 << ($logn_max)],
@@ -283,8 +283,9 @@ macro_rules! sign_key_impl {
                 if self.use_avx2 {
                     unsafe {
                         #[cfg(feature = "shake256x4")]
-                        sign_avx2::sign_avx2_inner::<T, shake::SHAKE256x4>(
+                        sign_avx2::sign_avx2_inner::<T, shake::SHAKE256x4, _>(
                             self.logn,
+                            DefaultHashToPoint::default(),
                             rng,
                             &self.f[..n],
                             &self.g[..n],
@@ -303,8 +304,9 @@ macro_rules! sign_key_impl {
                         );
 
                         #[cfg(not(feature = "shake256x4"))]
-                        sign_avx2::sign_avx2_inner::<T, shake::SHAKE256_PRNG>(
+                        sign_avx2::sign_avx2_inner::<T, shake::SHAKE256_PRNG, _>(
                             self.logn,
+                            DefaultHashToPoint::default(),
                             rng,
                             &self.f[..n],
                             &self.g[..n],
@@ -326,9 +328,10 @@ macro_rules! sign_key_impl {
                 }
 
                 #[cfg(feature = "shake256x4")]
-                sign_inner::<T, shake::SHAKE256x4>(
+                sign_inner::<T, shake::SHAKE256x4, _>(
                     self.logn,
                     rng,
+                    DefaultHashToPoint::default(),
                     &self.f[..n],
                     &self.g[..n],
                     &self.F[..n],
@@ -346,9 +349,10 @@ macro_rules! sign_key_impl {
                 );
 
                 #[cfg(not(feature = "shake256x4"))]
-                sign_inner::<T, shake::SHAKE256_PRNG>(
+                sign_inner::<T, shake::SHAKE256_PRNG, _>(
                     self.logn,
                     rng,
+                    DefaultHashToPoint::default(),
                     &self.f[..n],
                     &self.g[..n],
                     &self.F[..n],
@@ -513,9 +517,10 @@ fn compute_basis_inner(logn: u32, f: &[i8], g: &[i8], F: &[i8], G: &[i8], basis:
 // 1/12289
 const INV_Q: flr::FLR = flr::FLR::scaled(6004310871091074, -66);
 
-fn sign_inner<T: CryptoRng + RngCore, P: PRNG>(
+fn sign_inner<T: CryptoRng + RngCore, P: PRNG, H: HashToPoint>(
     logn: u32,
     rng: &mut T,
+    mut hasher: H,
     f: &[i8],
     g: &[i8],
     F: &[i8],
@@ -538,13 +543,13 @@ fn sign_inner<T: CryptoRng + RngCore, P: PRNG>(
     assert_eq!(sig.len(), signature_size(logn));
 
     // Special behaviour for the original Falcon algorithm (for test
-    // reproducibility). TODO: remove when switching to final test vectors.
-    let orig_falcon = id.0.len() == 1 && id.0[0] == 0xFF;
+    // reproducibility).
+    // let orig_falcon = id.0.len() == 1 && id.0[0] == 0xFF;
 
     // Hash the message with a 40-byte random nonce, to produce the
     // hashed message.
-    let mut nonce = [0u8; 40];
-    let mut first = true;
+    // let mut nonce = [0u8; 40];
+    // let mut first = true;
 
     // Usually the signature generation works at the first attempt, but
     // occasionally we need to try again because the obtained signature
@@ -556,12 +561,13 @@ fn sign_inner<T: CryptoRng + RngCore, P: PRNG>(
         // message to a polynomial hm[].
         // In the original Falcon, this was done once; in FN-DSA, this
         // is done at each loop restart.
-        // (TODO: align with final spec)
-        if first || !orig_falcon {
-            rng.fill_bytes(&mut nonce);
-            hash_to_point(&nonce, hashed_vrfy_key, ctx, id, hv, hm);
-            first = false;
-        }
+        // // (TODO: align with final spec)
+        // if first || !orig_falcon {
+        //     rng.fill_bytes(&mut nonce);
+        //     hash_to_point(&nonce, hashed_vrfy_key, ctx, id, hv, hm);
+        //     first = false;
+        // }
+        hasher.hash_to_point(rng, hashed_vrfy_key, ctx, id, hv, hm);
 
         // We initialize the PRNG with a 56-byte seed, to match the
         // practice from the C code (it makes it simpler to reproduce
@@ -781,7 +787,7 @@ fn sign_inner<T: CryptoRng + RngCore, P: PRNG>(
         // target size.
         if codec::comp_encode(s2, &mut sig[41..]) {
             sig[0] = 0x30 + (logn as u8);
-            sig[1..41].copy_from_slice(&nonce);
+            sig[1..41].copy_from_slice(hasher.nonce());
             return;
         }
     }
@@ -790,68 +796,82 @@ fn sign_inner<T: CryptoRng + RngCore, P: PRNG>(
 #[cfg(feature = "eth_falcon")]
 /// Support for ETH FALCON signature creation
 pub mod eth_falcon {
-    use super::{compute_basis_inner, INV_Q};
-    use fn_dsa_comm::{
-        codec,
-        eth_falcon::{hash_to_point_keccak, SALT_LEN},
-        mq,
-        shake::{self, SHAKE256_PRNG},
-        sign_key_size, vrfy_key_size, FN_DSA_LOGN_512,
-    };
+    use super::{sign_inner, SigningKey, SigningKey512, SigningKeyStandard};
+    use fn_dsa_comm::eth_falcon::EthFalconHashToPoint;
+    use fn_dsa_comm::{eth_falcon::SALT_LEN, shake::SHAKE256_PRNG};
     use rand_chacha::ChaCha20Rng;
-    use rand_core::{RngCore, SeedableRng};
+    use rand_core::{CryptoRng, RngCore, SeedableRng};
 
     const N: usize = 512;
-    const DOUBLE: usize = 2 * N;
-    const QUAD: usize = 4 * N;
-    const NINE: usize = 9 * N;
-    const SIGNING_KEY_LENGTH: usize = 1281;
 
-    /// Sign a message using ETHFALCON (Keccak-256 XOF)
-    ///
-    /// Takes an encoded private key, message, and salt, and produces a signature.
-    ///
-    /// # Arguments
-    /// * `private_key` - Encoded signing key bytes
-    /// * `message` - Message to sign
-    /// * `salt` - 40-byte random salt
-    ///
-    /// # Returns
-    /// * `Ok(signature)` - Falcon signature bytes
-    /// * `Err` if signing fails
-    pub fn sign(
-        private_key: &[u8; SIGNING_KEY_LENGTH],
-        message: &[u8],
-        salt: &[u8; SALT_LEN],
-        signature: &mut [u8],
-    ) -> Result<(), &'static str> {
-        // Decode the signing key to get f, g, F, G, and basis
-        let (logn, f, g, F, G, basis) = decode_signing_key(private_key)?;
-        assert_eq!(logn, FN_DSA_LOGN_512);
-        assert_eq!(1usize << logn, N);
+    /// Trait for generating ETHFALCON signatures
+    pub trait EthFalconSigningKey: SigningKey {
+        /// Sign a message using ETHFALCON (Keccak-256 XOF)
+        fn sign_eth<T: CryptoRng + RngCore>(
+            &mut self,
+            rng: &mut T,
+            message: &[u8],
+            salt: &[u8; SALT_LEN],
+            signature: &mut [u8],
+        );
+    }
 
-        // Generate random seed for signing
-        let mut rng = ChaCha20Rng::from_entropy();
-        let mut tmp_i16 = [0i16; N];
-        let mut tmp_u16 = [0u16; DOUBLE];
-        let mut tmp_flr = [super::flr::FLR::ZERO; NINE];
-        sign_ethfalcon_inner(
-            logn,
-            &mut rng,
-            &f,
-            &g,
-            &F,
-            &G,
-            message,
-            salt,
-            signature,
-            &basis,
-            &mut tmp_i16,
-            &mut tmp_u16,
-            &mut tmp_flr,
-        )?;
+    impl EthFalconSigningKey for SigningKeyStandard {
+        fn sign_eth<T: CryptoRng + RngCore>(
+            &mut self,
+            rng: &mut T,
+            message: &[u8],
+            salt: &[u8; SALT_LEN],
+            signature: &mut [u8],
+        ) {
+            sign_inner::<T, SHAKE256_PRNG, _>(
+                self.logn,
+                rng,
+                EthFalconHashToPoint::new(*salt),
+                &self.f[..N],
+                &self.g[..N],
+                &self.F[..N],
+                &self.G[..N],
+                &self.hashed_vrfy_key,
+                &super::DOMAIN_NONE,
+                &super::HASH_ID_RAW,
+                message,
+                signature,
+                &self.basis,
+                &mut self.tmp_i16,
+                &mut self.tmp_u16,
+                &mut self.tmp_flr,
+            );
+        }
+    }
 
-        Ok(())
+    impl EthFalconSigningKey for SigningKey512 {
+        fn sign_eth<T: CryptoRng + RngCore>(
+            &mut self,
+            rng: &mut T,
+            message: &[u8],
+            salt: &[u8; SALT_LEN],
+            signature: &mut [u8],
+        ) {
+            sign_inner::<T, SHAKE256_PRNG, _>(
+                self.logn,
+                rng,
+                EthFalconHashToPoint::new(*salt),
+                &self.f[..N],
+                &self.g[..N],
+                &self.F[..N],
+                &self.G[..N],
+                &self.hashed_vrfy_key,
+                &super::DOMAIN_NONE,
+                &super::HASH_ID_RAW,
+                message,
+                signature,
+                &self.basis,
+                &mut self.tmp_i16,
+                &mut self.tmp_u16,
+                &mut self.tmp_flr,
+            );
+        }
     }
 
     /// Generate a random salt for signing
@@ -862,346 +882,13 @@ pub mod eth_falcon {
         ChaCha20Rng::from_entropy().fill_bytes(&mut salt);
         salt
     }
-
-    /// Sign a message using ETHFALCON (Keccak-256 XOF)
-    ///
-    /// This is based on fn-dsa-sign's sign_inner() but with the hash_to_point
-    /// call replaced with our Keccak implementation.
-    ///
-    /// # Arguments
-    /// * `logn` - Polynomial degree (9 for Falcon-512)
-    /// * `rng` - Random number generator
-    /// * `f, g, F, G` - Private key components
-    /// * `message` - Message to sign
-    /// * `salt` - 40-byte salt
-    /// * `sig` - Output buffer for signature
-    /// * `basis` - Precomputed basis (optional, for performance)
-    /// * `tmp_i16, tmp_u16, tmp_flr` - Temporary buffers
-    fn sign_ethfalcon_inner(
-        logn: u32,
-        rng: &mut ChaCha20Rng,
-        f: &[i8],
-        g: &[i8],
-        F: &[i8],
-        G: &[i8],
-        message: &[u8],
-        salt: &[u8],
-        sig: &mut [u8],
-        #[cfg(not(feature = "small_context"))] basis: &[super::flr::FLR],
-        tmp_i16: &mut [i16],
-        tmp_u16: &mut [u16],
-        tmp_flr: &mut [super::flr::FLR],
-    ) -> Result<(), &'static str> {
-        // let n = 1usize << logn;
-        assert_eq!(1usize << logn, N);
-        assert_eq!(f.len(), N);
-        assert_eq!(g.len(), N);
-        assert_eq!(F.len(), N);
-        assert_eq!(G.len(), N);
-        assert_eq!(salt.len(), SALT_LEN);
-
-        // Signature generation loop
-        // Usually works on first attempt, but occasionally we need to retry
-        // if signature is not short enough or cannot be encoded
-        loop {
-            let hm = &mut tmp_u16[0..N];
-
-            // THIS IS THE KEY CHANGE: Use our Keccak hash_to_point instead of SHAKE256
-            hash_to_point_keccak(N, message, salt)
-                .map_err(|_| "Hash to point failed")?
-                .iter()
-                .enumerate()
-                .for_each(|(i, &v)| hm[i] = v);
-
-            // Initialize PRNG with 56-byte seed for sampling
-            let mut seed = [0u8; 56];
-            rng.fill_bytes(&mut seed);
-            let mut samp = super::sampler::Sampler::<SHAKE256_PRNG>::new(logn, &seed);
-
-            // Compute Gram matrix from lattice basis B = [[g, -f], [G, -F]]
-            #[cfg(feature = "small_context")]
-            {
-                compute_basis_inner(logn, f, g, F, G, tmp_flr);
-
-                let (b00, work) = tmp_flr.split_at_mut(N);
-                let (b01, work) = work.split_at_mut(N);
-                let (b10, work) = work.split_at_mut(N);
-                let (b11, work) = work.split_at_mut(N);
-                let (t0, work) = work.split_at_mut(N);
-                let (t1, _) = work.split_at_mut(N);
-
-                // Compute g00, g01, g11 (Gram matrix)
-                t0.copy_from_slice(&*b01);
-                super::poly::poly_mulownadj_fft(logn, t0);
-
-                t1.copy_from_slice(&*b00);
-                super::poly::poly_muladj_fft(logn, t1, b10);
-
-                super::poly::poly_mulownadj_fft(logn, b00);
-                super::poly::poly_add(logn, b00, t0);
-
-                t0.copy_from_slice(b01);
-
-                super::poly::poly_muladj_fft(logn, b01, b11);
-                super::poly::poly_add(logn, b01, t1);
-
-                super::poly::poly_mulownadj_fft(logn, b10);
-
-                t1.copy_from_slice(b11);
-                super::poly::poly_mulownadj_fft(logn, t1);
-                super::poly::poly_add(logn, b10, t1);
-            }
-
-            #[cfg(not(feature = "small_context"))]
-            {
-                let (b00, work) = basis.split_at(N);
-                let (b01, work) = work.split_at(N);
-                let (b10, work) = work.split_at(N);
-                let (b11, _) = work.split_at(N);
-
-                let (g00, work) = tmp_flr.split_at_mut(N);
-                let (g01, work) = work.split_at_mut(N);
-                let (g11, work) = work.split_at_mut(N);
-                let (t0, work) = work.split_at_mut(N);
-                let (t1, _) = work.split_at_mut(N);
-
-                g00.copy_from_slice(b00);
-                super::poly::poly_mulownadj_fft(logn, g00);
-                t0.copy_from_slice(b01);
-                super::poly::poly_mulownadj_fft(logn, t0);
-                super::poly::poly_add(logn, g00, t0);
-
-                g01.copy_from_slice(b00);
-                super::poly::poly_muladj_fft(logn, g01, b10);
-                t0.copy_from_slice(b01);
-                super::poly::poly_muladj_fft(logn, t0, b11);
-                super::poly::poly_add(logn, g01, t0);
-
-                g11.copy_from_slice(b10);
-                super::poly::poly_mulownadj_fft(logn, g11);
-                t0.copy_from_slice(b11);
-                super::poly::poly_mulownadj_fft(logn, t0);
-                super::poly::poly_add(logn, g11, t0);
-
-                t0.copy_from_slice(b11);
-                t1.copy_from_slice(b01);
-            }
-
-            // Memory layout: g00 g01 g11 b11 b01
-            {
-                let (_, work) = tmp_flr.split_at_mut(3 * N);
-                let (b11, work) = work.split_at_mut(N);
-                let (b01, work) = work.split_at_mut(N);
-                let (t0, work) = work.split_at_mut(N);
-                let (t1, _) = work.split_at_mut(N);
-
-                // Set target to [hm, 0]
-                for i in 0..N {
-                    t0[i] = super::flr::FLR::from_i32(hm[i] as i32);
-                }
-
-                // Apply lattice basis
-                super::poly::FFT(logn, t0);
-                t1.copy_from_slice(t0);
-                super::poly::poly_mul_fft(logn, t1, b01);
-                super::poly::poly_mulconst(logn, t1, -INV_Q);
-                super::poly::poly_mul_fft(logn, t0, b11);
-                super::poly::poly_mulconst(logn, t0, INV_Q);
-            }
-
-            // Move (t0, t1) back
-            tmp_flr.copy_within((5 * N)..(7 * N), 3 * N);
-
-            // Apply Gaussian sampling
-            {
-                let (g00, work) = tmp_flr.split_at_mut(N);
-                let (g01, work) = work.split_at_mut(N);
-                let (g11, work) = work.split_at_mut(N);
-                let (t0, work) = work.split_at_mut(N);
-                let (t1, work) = work.split_at_mut(N);
-                samp.ffsamp_fft(t0, t1, g00, g01, g11, work);
-            }
-
-            // Rearrange to: b00 b01 b10 b11 t0 t1
-            tmp_flr.copy_within((3 * N)..(5 * N), 4 * N);
-
-            #[cfg(feature = "small_context")]
-            compute_basis_inner(logn, f, g, F, G, tmp_flr);
-
-            #[cfg(not(feature = "small_context"))]
-            tmp_flr[..(4 * N)].copy_from_slice(&basis[..(4 * N)]);
-
-            let (b00, work) = tmp_flr.split_at_mut(N);
-            let (b01, work) = work.split_at_mut(N);
-            let (b10, work) = work.split_at_mut(N);
-            let (b11, work) = work.split_at_mut(N);
-            let (t0, work) = work.split_at_mut(N);
-            let (t1, work) = work.split_at_mut(N);
-            let (tx, work) = work.split_at_mut(N);
-            let (ty, _) = work.split_at_mut(N);
-
-            // Get lattice point corresponding to sampled vector
-            tx.copy_from_slice(t0);
-            ty.copy_from_slice(t1);
-            super::poly::poly_mul_fft(logn, tx, b00);
-            super::poly::poly_mul_fft(logn, ty, b10);
-            super::poly::poly_add(logn, tx, ty);
-            ty.copy_from_slice(t0);
-            super::poly::poly_mul_fft(logn, ty, b01);
-            t0.copy_from_slice(tx);
-            super::poly::poly_mul_fft(logn, t1, b11);
-            super::poly::poly_add(logn, t1, ty);
-            super::poly::iFFT(logn, t0);
-            super::poly::iFFT(logn, t1);
-
-            // Compute signature and check norm
-            let mut sqn = 0u32;
-            let mut ng = 0;
-            for i in 0..N {
-                let z = (hm[i] as i32) - (t0[i].rint() as i32);
-                let z = (z as i16) as i32;
-                sqn = sqn.wrapping_add((z * z) as u32);
-                ng |= sqn;
-            }
-
-            let s2 = &mut tmp_i16[..N];
-            for i in 0..N {
-                let sz = (-t1[i].rint()) as i16;
-                let z = sz as i32;
-                sqn = sqn.wrapping_add((z * z) as u32);
-                ng |= sqn;
-                s2[i] = sz;
-            }
-
-            // Check if signature is short enough
-            sqn |= ((ng as i32) >> 31) as u32;
-            if sqn > mq::SQBETA[logn as usize] {
-                continue; // Retry
-            }
-
-            // Encode signature
-            if codec::comp_encode(s2, &mut sig[41..]) {
-                sig[0] = 0x30 + (logn as u8);
-                sig[1..41].copy_from_slice(salt);
-                return Ok(());
-            }
-
-            // Encoding failed, retry
-        }
-    }
-
-    /// Decode a Falcon private key
-    ///
-    /// Returns (logn, f, g, F, G, basis) if successful
-    fn decode_signing_key(
-        src: &[u8],
-    ) -> Result<
-        (
-            u32,
-            [i8; N],
-            [i8; N],
-            [i8; N],
-            [i8; N],
-            [super::flr::FLR; QUAD],
-        ),
-        &'static str,
-    > {
-        if src.len() < 1 {
-            return Err("Key too short");
-        }
-        let head = src[0];
-        if (head & 0xF0) != 0x50 {
-            return Err("Invalid key header");
-        }
-        let logn = (head & 0x0F) as u32;
-        if logn != FN_DSA_LOGN_512 {
-            return Err("Invalid logn (only Falcon-512 supported)");
-        }
-        if src.len() != sign_key_size(logn) {
-            return Err("Invalid key length");
-        }
-
-        // let n = 1usize << logn;
-        assert_eq!(1usize << logn, N);
-
-        let mut f = [0i8; N];
-        let mut g = [0i8; N];
-        let mut F = [0i8; N];
-        let mut G = [0i8; N];
-        let mut vrfy_key = [0u8; vrfy_key_size(FN_DSA_LOGN_512)];
-        let mut hashed_vrfy_key = [0u8; 64];
-        let mut tmp_u16 = [0u16; DOUBLE];
-
-        // Decode f, g, F from the key
-        let nbits_fg = match logn {
-            2..=5 => 8,
-            6..=7 => 7,
-            8..=9 => 6,
-            _ => 5,
-        };
-
-        let j =
-            1 + codec::trim_i8_decode(&src[1..], &mut f, nbits_fg).ok_or("Failed to decode f")?;
-        let j =
-            j + codec::trim_i8_decode(&src[j..], &mut g, nbits_fg).ok_or("Failed to decode g")?;
-        let j = j + codec::trim_i8_decode(&src[j..], &mut F, 8).ok_or("Failed to decode F")?;
-
-        if j != src.len() {
-            return Err("Key decoding length mismatch");
-        }
-
-        // Compute G from f, g, F
-        // G = g*F/f mod q
-        let (w0, w1) = tmp_u16.split_at_mut(N);
-
-        // w0 <- g/f (NTT)
-        mq::mqpoly_small_to_int(logn, &g, w0);
-        mq::mqpoly_small_to_int(logn, &f, w1);
-        mq::mqpoly_int_to_NTT(logn, w0);
-        mq::mqpoly_int_to_NTT(logn, w1);
-        if !mq::mqpoly_div_ntt(logn, w0, w1) {
-            return Err("f is not invertible");
-        }
-
-        // w1 <- h*F = g*F/f = G (NTT)
-        mq::mqpoly_small_to_int(logn, &F, w1);
-        mq::mqpoly_int_to_NTT(logn, w1);
-        mq::mqpoly_mul_ntt(logn, w1, w0);
-
-        // Compute public key h = g/f mod q
-        mq::mqpoly_NTT_to_int(logn, w0);
-        mq::mqpoly_int_to_ext(logn, w0);
-        vrfy_key[0] = 0x00 + (logn as u8);
-        let j = 1 + codec::modq_encode(&w0[..N], &mut vrfy_key[1..]);
-        if j != vrfy_key.len() {
-            return Err("Public key encoding length mismatch");
-        }
-
-        // Hash the public key (using SHAKE256, as in original Falcon)
-        let mut sh = shake::SHAKE256::new();
-        sh.inject(&vrfy_key);
-        sh.flip();
-        sh.extract(&mut hashed_vrfy_key);
-
-        // Convert G back to external representation
-        mq::mqpoly_NTT_to_int(logn, w1);
-        if !mq::mqpoly_int_to_small(logn, w1, &mut G) {
-            return Err("G coefficients out of range");
-        }
-
-        // Compute the basis B = [[g, -f], [G, -F]] in FFT format
-        let mut basis = [super::flr::FLR::ZERO; QUAD];
-        compute_basis_inner(logn, &f, &g, &F, &G, &mut basis);
-
-        Ok((logn, f, g, F, G, basis))
-    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-
     use super::*;
     use fn_dsa_comm::shake::SHAKE256;
+    use fn_dsa_comm::DefaultHashToPoint;
 
     // We need SHAKE256x4 for some tests (because test vectors were
     // originally built with that PRNG). If we are not using it in
@@ -1683,9 +1370,10 @@ pub(crate) mod tests {
             basis
         };
 
-        sign_inner::<FakeCryptoRng, ChaCha20PRNG>(
+        sign_inner::<FakeCryptoRng, ChaCha20PRNG, _>(
             9,
             &mut rng,
+            DefaultHashToPoint::default(),
             &KAT_512_f,
             &KAT_512_g,
             &KAT_512_F,

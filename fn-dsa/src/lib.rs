@@ -126,9 +126,9 @@ pub use fn_dsa_comm::eth_falcon::{
     decode_pubkey_to_ntt_packed, decode_signature_to_packed, hash_to_point_keccak,
 };
 #[cfg(feature = "eth_falcon")]
-pub use fn_dsa_sign::eth_falcon::{generate_salt, sign as eth_falcon_sign};
+pub use fn_dsa_sign::eth_falcon::{generate_salt, EthFalconSigningKey};
 #[cfg(feature = "eth_falcon")]
-pub use fn_dsa_vrfy::eth_falcon::verify as eth_falcon_verify;
+pub use fn_dsa_vrfy::eth_falcon::EthFalconVerifyingKey;
 
 #[cfg(test)]
 mod tests {
@@ -585,6 +585,7 @@ mod eth_falcon_tests {
     use super::*;
 
     use fn_dsa_comm::eth_falcon::{SALT_LEN, SIGNATURE_ABI_PACKED_LENGTH};
+    use fn_dsa_sign::{eth_falcon::EthFalconSigningKey, SigningKey, SigningKeyStandard};
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
     use std::{println, vec::Vec};
@@ -607,12 +608,14 @@ mod eth_falcon_tests {
     fn test_sign_verify_full_roundtrip() {
         let (_, sk) = keygen_random();
 
+        let mut signing_key = SigningKeyStandard::decode(&sk).unwrap();
         let message = b"Hello, ETHFALCON!";
         let salt = generate_salt();
-        let mut signature = [0u8; sign_key_size(FN_DSA_LOGN_512)];
+        let mut signature = [0u8; signature_size(FN_DSA_LOGN_512)];
+        let mut rng = ChaCha8Rng::seed_from_u64(1234);
 
         // Sign the message
-        eth_falcon_sign(&sk, message, &salt, &mut signature).expect("Signing should succeed");
+        signing_key.sign_eth(&mut rng, message, &salt, &mut signature);
 
         println!("Signature length: {}", signature.len());
         println!("Signature header: 0x{:02x}", signature[0]);
@@ -634,16 +637,18 @@ mod eth_falcon_tests {
     fn test_complete_sign_and_verify_roundtrip() {
         // Generate a test keypair
         let (pk, sk) = keygen_random();
+        let mut signing_key = SigningKeyStandard::decode(&sk).unwrap();
 
         let message = b"ETHFALCON test message";
         let salt = generate_salt();
-        let mut signature = [0u8; sign_key_size(FN_DSA_LOGN_512)];
+        let mut signature = [0u8; signature_size(FN_DSA_LOGN_512)];
+        let mut rng = ChaCha8Rng::seed_from_u64(1234);
 
         println!("\n=== ETHFALCON Sign+Verify Roundtrip Test ===");
         println!("Message: {:?}", std::str::from_utf8(message).unwrap());
 
         // Sign the message
-        eth_falcon_sign(&sk, message, &salt, &mut signature).expect("Signing should succeed");
+        signing_key.sign_eth(&mut rng, message, &salt, &mut signature);
         println!(
             "✓ Signed successfully (signature length: {})",
             signature.len()
@@ -667,8 +672,8 @@ mod eth_falcon_tests {
         let signature_salt = <[u8; SALT_LEN]>::try_from(&signature[1..41]).unwrap();
 
         // Verify the signature
-        let is_valid = eth_falcon_verify(message, &signature_salt, &s2_packed, &pk_ntt_packed)
-            .expect("Verification should not error");
+        let vrfy_key = EthFalconVerifyingKey::decode(&pk_ntt_packed);
+        let is_valid = vrfy_key.verify(message, &signature_salt, &s2_packed);
 
         println!(
             "✓ Verification result: {}",
@@ -703,18 +708,14 @@ mod eth_falcon_tests {
 
         // Decode public key to NTT format
         let pk_ntt_packed = decode_pubkey_to_ntt_packed(&pk).expect("Failed to decode public key");
+        let vrfy_key = EthFalconVerifyingKey::decode(&pk_ntt_packed);
 
         // Decode signature to abi.encodePacked format
         let s2_packed = decode_kat_signature(&sm, mlen).expect("Failed to decode signature");
 
         // Verify the signature
-        let result = eth_falcon_verify(&msg, &salt, &s2_packed, &pk_ntt_packed);
-        assert!(
-            result.is_ok(),
-            "Verification should not error: {:?}",
-            result
-        );
-        assert!(result.unwrap(), "Signature should verify successfully");
+        let result = vrfy_key.verify(&msg, &salt, &s2_packed);
+        assert!(result, "Signature should verify successfully");
     }
 
     /// Decode KAT signature from sm format to abi.encodePacked format
