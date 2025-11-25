@@ -612,10 +612,9 @@ mod eth_falcon_tests {
         let message = b"Hello, ETHFALCON!";
         let salt = generate_salt();
         let mut signature = [0u8; signature_size(FN_DSA_LOGN_512)];
-        let mut rng = ChaCha8Rng::seed_from_u64(1234);
 
         // Sign the message
-        signing_key.sign_eth(&mut rng, message, &salt, &mut signature);
+        signing_key.sign_eth(message, &salt, &mut signature);
 
         println!("Signature length: {}", signature.len());
         println!("Signature header: 0x{:02x}", signature[0]);
@@ -642,13 +641,12 @@ mod eth_falcon_tests {
         let message = b"ETHFALCON test message";
         let salt = generate_salt();
         let mut signature = [0u8; signature_size(FN_DSA_LOGN_512)];
-        let mut rng = ChaCha8Rng::seed_from_u64(1234);
 
         println!("\n=== ETHFALCON Sign+Verify Roundtrip Test ===");
         println!("Message: {:?}", std::str::from_utf8(message).unwrap());
 
         // Sign the message
-        signing_key.sign_eth(&mut rng, message, &salt, &mut signature);
+        signing_key.sign_eth(message, &salt, &mut signature);
         println!(
             "✓ Signed successfully (signature length: {})",
             signature.len()

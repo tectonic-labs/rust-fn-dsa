@@ -800,33 +800,45 @@ pub mod eth_falcon {
     use fn_dsa_comm::eth_falcon::EthFalconHashToPoint;
     use fn_dsa_comm::{eth_falcon::SALT_LEN, shake::SHAKE256_PRNG};
     use rand_chacha::ChaCha20Rng;
-    use rand_core::{CryptoRng, RngCore, SeedableRng};
+    use rand_core::{CryptoRng, Error, RngCore, SeedableRng};
 
     const N: usize = 512;
+
+    struct DummyRng;
+
+    impl CryptoRng for DummyRng {}
+
+    impl RngCore for DummyRng {
+        fn next_u32(&mut self) -> u32 {
+            0
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            0
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.iter_mut().for_each(|b| *b = 0);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
 
     /// Trait for generating ETHFALCON signatures
     pub trait EthFalconSigningKey: SigningKey {
         /// Sign a message using ETHFALCON (Keccak-256 XOF)
-        fn sign_eth<T: CryptoRng + RngCore>(
-            &mut self,
-            rng: &mut T,
-            message: &[u8],
-            salt: &[u8; SALT_LEN],
-            signature: &mut [u8],
-        );
+        fn sign_eth(&mut self, message: &[u8], salt: &[u8; SALT_LEN], signature: &mut [u8]);
     }
 
     impl EthFalconSigningKey for SigningKeyStandard {
-        fn sign_eth<T: CryptoRng + RngCore>(
-            &mut self,
-            rng: &mut T,
-            message: &[u8],
-            salt: &[u8; SALT_LEN],
-            signature: &mut [u8],
-        ) {
-            sign_inner::<T, SHAKE256_PRNG, _>(
+        fn sign_eth(&mut self, message: &[u8], salt: &[u8; SALT_LEN], signature: &mut [u8]) {
+            let mut rng = DummyRng;
+            sign_inner::<_, SHAKE256_PRNG, _>(
                 self.logn,
-                rng,
+                &mut rng,
                 EthFalconHashToPoint::new(*salt),
                 &self.f[..N],
                 &self.g[..N],
@@ -846,16 +858,11 @@ pub mod eth_falcon {
     }
 
     impl EthFalconSigningKey for SigningKey512 {
-        fn sign_eth<T: CryptoRng + RngCore>(
-            &mut self,
-            rng: &mut T,
-            message: &[u8],
-            salt: &[u8; SALT_LEN],
-            signature: &mut [u8],
-        ) {
-            sign_inner::<T, SHAKE256_PRNG, _>(
+        fn sign_eth(&mut self, message: &[u8], salt: &[u8; SALT_LEN], signature: &mut [u8]) {
+            let mut rng = DummyRng;
+            sign_inner::<_, SHAKE256_PRNG, _>(
                 self.logn,
-                rng,
+                &mut rng,
                 EthFalconHashToPoint::new(*salt),
                 &self.f[..N],
                 &self.g[..N],
