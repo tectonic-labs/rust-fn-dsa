@@ -357,7 +357,7 @@ unsafe fn verify_avx2_inner(
     // norm2 <- squared norm of s2. Note that successful decoding implies
     // that every coefficient is at most 2047 (in absolute value); hence,
     // the maximum squared norm is at most 1024*(2047^2) < 2^32.
-    // let norm2 = mq_avx2::signed_poly_sqnorm(logn, &*s2i);
+    let norm2 = mq_avx2::signed_poly_sqnorm(logn, &*s2i);
 
     // t1 <- c = hashed message (internal format)
     hash_to_point(&sig[1..41], hashed_key, ctx, id, hv, t1);
