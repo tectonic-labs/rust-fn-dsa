@@ -419,7 +419,7 @@ pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG, H: HashToP
         // target size.
         if codec::comp_encode(s2, &mut sig[41..]) {
             sig[0] = 0x30 + (logn as u8);
-            sig[1..41].copy_from_slice(&nonce);
+            sig[1..41].copy_from_slice(hasher.nonce());
             return;
         }
     }
