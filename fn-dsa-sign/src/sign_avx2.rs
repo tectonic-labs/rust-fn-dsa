@@ -2,6 +2,7 @@
 #![allow(non_upper_case_globals)]
 
 use super::*;
+use core::hash::Hash;
 use fn_dsa_comm::mq_avx2;
 
 #[path = "poly_avx2.rs"]
@@ -13,11 +14,18 @@ mod sampler_avx2;
 // This is a specialized version of decode_inner() (defined in the
 // parent module); it leverages AVX2 intrinsics to speed up operations.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn decode_avx2_inner(logn_min: u32, logn_max: u32,
-    f: &mut [i8], g: &mut [i8], F: &mut [i8], G: &mut [i8],
-    vrfy_key: &mut [u8], hashed_vrfy_key: &mut [u8],
-    tmp_u16: &mut [u16], src: &[u8]) -> Option<u32>
-{
+pub(crate) unsafe fn decode_avx2_inner(
+    logn_min: u32,
+    logn_max: u32,
+    f: &mut [i8],
+    g: &mut [i8],
+    F: &mut [i8],
+    G: &mut [i8],
+    vrfy_key: &mut [u8],
+    hashed_vrfy_key: &mut [u8],
+    tmp_u16: &mut [u16],
+    src: &[u8],
+) -> Option<u32> {
     if src.len() < 1 {
         return None;
     }
@@ -110,9 +118,14 @@ pub(crate) unsafe fn decode_avx2_inner(logn_min: u32, logn_max: u32,
 // This is a specialized version of compute_basis_inner() (defined in the
 // parent module); it leverages AVX2 intrinsics to speed up operations.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn compute_basis_avx2_inner(logn: u32,
-    f: &[i8], g: &[i8], F: &[i8], G: &[i8], basis: &mut [flr::FLR])
-{
+pub(crate) unsafe fn compute_basis_avx2_inner(
+    logn: u32,
+    f: &[i8],
+    g: &[i8],
+    F: &[i8],
+    G: &[i8],
+    basis: &mut [flr::FLR],
+) {
     let n = 1usize << logn;
 
     // Lattice basis is B = [[g, -f], [G, -F]].
@@ -136,14 +149,24 @@ pub(crate) unsafe fn compute_basis_avx2_inner(logn: u32,
 // This is a specialized version of sign_inner() (defined in the parent
 // module); it leverages AVX2 intrinsics to speed up operations.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG>(
-    logn: u32, rng: &mut T,
-    f: &[i8], g: &[i8], F: &[i8], G: &[i8], hashed_vrfy_key: &[u8],
-    ctx: &DomainContext, id: &HashIdentifier, hv: &[u8], sig: &mut [u8],
-    #[cfg(not(feature = "small_context"))]
-    basis: &[flr::FLR],
-    tmp_i16: &mut [i16], tmp_u16: &mut [u16], tmp_flr: &mut [flr::FLR])
-{
+pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG, H: HashToPoint>(
+    logn: u32,
+    mut hasher: H,
+    rng: &mut T,
+    f: &[i8],
+    g: &[i8],
+    F: &[i8],
+    G: &[i8],
+    hashed_vrfy_key: &[u8],
+    ctx: &DomainContext,
+    id: &HashIdentifier,
+    hv: &[u8],
+    sig: &mut [u8],
+    #[cfg(not(feature = "small_context"))] basis: &[flr::FLR],
+    tmp_i16: &mut [i16],
+    tmp_u16: &mut [u16],
+    tmp_flr: &mut [flr::FLR],
+) {
     let n = 1usize << logn;
     assert!(f.len() == n);
     assert!(g.len() == n);
@@ -153,12 +176,12 @@ pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG>(
 
     // Special behaviour for the original Falcon algorithm (for test
     // reproducibility). TODO: remove when switching to final test vectors.
-    let orig_falcon = id.0.len() == 1 && id.0[0] == 0xFF;
+    // let orig_falcon = id.0.len() == 1 && id.0[0] == 0xFF;
 
     // Hash the message with a 40-byte random nonce, to produce the
     // hashed message.
-    let mut nonce = [0u8; 40];
-    let mut first = true;
+    // let mut nonce = [0u8; 40];
+    // let mut first = true;
 
     // Usually the signature generation works at the first attempt, but
     // occasionally we need to try again because the obtained signature
@@ -170,12 +193,13 @@ pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG>(
         // message to a polynomial hm[].
         // In the original Falcon, this was done once; in FN-DSA, this
         // is done at each loop restart.
-        // (TODO: align with final spec)
-        if first || !orig_falcon {
-            rng.fill_bytes(&mut nonce);
-            hash_to_point(&nonce, hashed_vrfy_key, ctx, id, hv, hm);
-            first = false;
-        }
+        // // (TODO: align with final spec)
+        // if first || !orig_falcon {
+        //     rng.fill_bytes(&mut nonce);
+        //     hash_to_point(&nonce, hashed_vrfy_key, ctx, id, hv, hm);
+        //     first = false;
+        // }
+        hasher.hash_to_point(rng, hashed_vrfy_key, ctx, id, hv, hm);
 
         // We initialize the PRNG with a 56-byte seed, to match the
         // practice from the C code (it makes it simpler to reproduce
@@ -395,7 +419,7 @@ pub(crate) unsafe fn sign_avx2_inner<T: CryptoRng + RngCore, P: PRNG>(
         // target size.
         if codec::comp_encode(s2, &mut sig[41..]) {
             sig[0] = 0x30 + (logn as u8);
-            sig[1..41].copy_from_slice(&nonce);
+            sig[1..41].copy_from_slice(hasher.nonce());
             return;
         }
     }
