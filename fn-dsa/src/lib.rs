@@ -106,9 +106,9 @@
 pub use fn_dsa_comm::shake::{SHA3_224, SHA3_256, SHA3_384, SHA3_512, SHAKE, SHAKE128, SHAKE256};
 pub use fn_dsa_comm::{
     sign_key_size, signature_size, vrfy_key_size, CryptoRng, DomainContext, HashIdentifier,
-    RngCore, RngError, DOMAIN_NONE, FN_DSA_LOGN_1024, FN_DSA_LOGN_512, HASH_ID_ORIGINAL_FALCON,
-    HASH_ID_RAW, HASH_ID_SHA256, HASH_ID_SHA384, HASH_ID_SHA3_256, HASH_ID_SHA3_384,
-    HASH_ID_SHA3_512, HASH_ID_SHA512, HASH_ID_SHA512_256, HASH_ID_SHAKE128, HASH_ID_SHAKE256,
+    RngCore, DOMAIN_NONE, FN_DSA_LOGN_1024, FN_DSA_LOGN_512, HASH_ID_ORIGINAL_FALCON, HASH_ID_RAW,
+    HASH_ID_SHA256, HASH_ID_SHA384, HASH_ID_SHA3_256, HASH_ID_SHA3_384, HASH_ID_SHA3_512,
+    HASH_ID_SHA512, HASH_ID_SHA512_256, HASH_ID_SHAKE128, HASH_ID_SHAKE256,
 };
 pub use fn_dsa_kgen::{
     KeyPairGenerator, KeyPairGenerator1024, KeyPairGenerator512, KeyPairGeneratorStandard,
@@ -164,10 +164,6 @@ mod tests {
         fn fill_bytes(&mut self, dest: &mut [u8]) {
             self.0.extract(dest);
         }
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RngError> {
-            self.fill_bytes(dest);
-            Ok(())
-        }
     }
 
     struct FakeRng2 {
@@ -214,10 +210,6 @@ mod tests {
                 j += clen;
             }
             self.ptr = ptr;
-        }
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RngError> {
-            self.fill_bytes(dest);
-            Ok(())
         }
     }
 

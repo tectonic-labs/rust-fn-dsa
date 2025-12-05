@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [dependencies]
 fn-dsa-comm = { version = "0.3", path = "../fn-dsa-comm" }
-rand_core = { workspace = true, optional = true, features = ["getrandom"] }
+rand_core = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 zeroize.workspace = true
 

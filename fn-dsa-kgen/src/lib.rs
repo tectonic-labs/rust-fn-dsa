@@ -100,7 +100,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // Re-export useful types, constants and functions.
 pub use fn_dsa_comm::{
-    sign_key_size, vrfy_key_size, CryptoRng, RngCore, RngError, FN_DSA_LOGN_1024, FN_DSA_LOGN_512,
+    sign_key_size, vrfy_key_size, CryptoRng, RngCore, FN_DSA_LOGN_1024, FN_DSA_LOGN_512,
 };
 
 /// Key pair generator and temporary buffers.

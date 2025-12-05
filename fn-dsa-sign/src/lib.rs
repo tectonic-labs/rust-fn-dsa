@@ -69,9 +69,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 // Re-export useful types, constants and functions.
 pub use fn_dsa_comm::{
     sign_key_size, signature_size, vrfy_key_size, CryptoRng, DomainContext, HashIdentifier,
-    RngCore, RngError, DOMAIN_NONE, FN_DSA_LOGN_1024, FN_DSA_LOGN_512, HASH_ID_ORIGINAL_FALCON,
-    HASH_ID_RAW, HASH_ID_SHA256, HASH_ID_SHA384, HASH_ID_SHA3_256, HASH_ID_SHA3_384,
-    HASH_ID_SHA3_512, HASH_ID_SHA512, HASH_ID_SHA512_256, HASH_ID_SHAKE128, HASH_ID_SHAKE256,
+    RngCore, DOMAIN_NONE, FN_DSA_LOGN_1024, FN_DSA_LOGN_512, HASH_ID_ORIGINAL_FALCON, HASH_ID_RAW,
+    HASH_ID_SHA256, HASH_ID_SHA384, HASH_ID_SHA3_256, HASH_ID_SHA3_384, HASH_ID_SHA3_512,
+    HASH_ID_SHA512, HASH_ID_SHA512_256, HASH_ID_SHAKE128, HASH_ID_SHAKE256,
 };
 
 /// Signing key handler and temporary buffers.
@@ -1343,10 +1343,6 @@ pub(crate) mod tests {
             dest.copy_from_slice(&KAT_512_RND[self.0..(self.0 + dest.len())]);
             self.0 += dest.len();
         }
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RngError> {
-            self.fill_bytes(dest);
-            Ok(())
-        }
     }
 
     #[test]
@@ -1441,8 +1437,9 @@ pub(crate) mod tests {
         };
 
         unsafe {
-            sign_avx2::sign_avx2_inner::<FakeCryptoRng, ChaCha20PRNG>(
+            sign_avx2::sign_avx2_inner::<FakeCryptoRng, ChaCha20PRNG, DefaultHashToPoint>(
                 9,
+                DefaultHashToPoint::default(),
                 &mut rng,
                 &KAT_512_f,
                 &KAT_512_g,

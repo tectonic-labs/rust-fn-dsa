@@ -21,7 +21,7 @@ pub mod shake;
 pub mod mq_avx2;
 
 // Re-export RNG traits to get a smooth dependency management.
-pub use rand_core::{CryptoRng, Error as RngError, RngCore};
+pub use rand_core::{CryptoRng, RngCore};
 
 /// Symbolic constant for FN-DSA with degree 512 (`logn = 9`).
 pub const FN_DSA_LOGN_512: u32 = 9;
